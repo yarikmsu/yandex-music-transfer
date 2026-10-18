@@ -72,7 +72,8 @@ The importer's unit tests run offline:
 docker run --rm --network none -v "$PWD/importer:/app:ro" -w /app python:3.13-slim python -B -m unittest
 ```
 
-## Credits
+## License
 
-The Yandex Music exporter is by [Ermegilius](https://github.com/Ermegilius),
-under the MIT license ([exporter/LICENSE](exporter/LICENSE)).
+[MIT](LICENSE). The Yandex Music exporter in `exporter/` is by
+[Ermegilius](https://github.com/Ermegilius), also under the MIT license, with its own
+copyright notice in [exporter/LICENSE](exporter/LICENSE).
