@@ -1,0 +1,14 @@
+# Tokens: only the *.example templates are committed
+run/.env
+run/.apple.env
+*.env
+
+# Exported and matched libraries (personal data)
+out/
+
+# Local review checkout of the upstream exporter (has its own .git)
+audit/
+
+.DS_Store
+__pycache__/
+*.pyc
