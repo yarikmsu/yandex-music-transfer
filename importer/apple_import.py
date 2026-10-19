@@ -90,6 +90,8 @@ def _retry_delay(retry_after: str | None, attempt: int, base: int) -> int:
 class JsonClient:
     """JSON over HTTPS with a pause between requests."""
 
+    service = "Apple"
+
     def __init__(self, base: str, headers: dict, pause: float, rate_limit_codes=(429,)):
         self.base = base
         self.headers = headers
@@ -98,7 +100,7 @@ class JsonClient:
 
     def _slow_down(self) -> None:
         self.pause = min(self.pause * 2, MAX_REQUEST_PAUSE)
-        print(f"  Rate limited by Apple; now one request every {self.pause:g}s")
+        print(f"  Rate limited by {self.service}; now one request every {self.pause:g}s")
 
     def request(self, method: str, path: str, params: dict | None = None, body=None) -> dict:
         """Send one request. Rate limits are waited out however long they last,

@@ -380,6 +380,15 @@ class RateLimitTest(unittest.TestCase):
             with self.assertRaises(ai.ApiError):
                 client.request("GET", "/v1/test")
 
+    def test_slow_down_message_names_the_service(self):
+        class ExampleClient(ai.JsonClient):
+            service = "Example"
+
+        client = ExampleClient("https://example.com", {}, 1)
+        with mock.patch("builtins.print") as printed:
+            client._slow_down()
+        self.assertIn("Rate limited by Example", printed.call_args.args[0])
+
     def test_bad_request_is_not_retried(self):
         rejected = urllib.error.HTTPError("url", 400, "Bad Request", {}, io.BytesIO(b"bad"))
         client = ai.AppleMusicClient("dev", "user")
