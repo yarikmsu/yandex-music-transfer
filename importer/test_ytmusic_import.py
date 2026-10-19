@@ -88,6 +88,8 @@ class FakeYouTube:
         self.calls.append((endpoint, body))
         if endpoint == "search":
             return response(*self.answers.get((body["query"], body["params"]), []))
+        if endpoint == "account/account_menu":
+            return menu("Test User")
         return {}
 
     def queries(self):
@@ -100,6 +102,20 @@ class InTempDir(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(tmp.name)
+
+
+def menu(name, handle=None):
+    """The account menu of a signed-in session."""
+    header = {"accountName": {"runs": [{"text": name}]}}
+    if handle:
+        header["channelHandle"] = {"runs": [{"text": handle}]}
+    return {"actions": [{"openPopupAction": {"popup": {"multiPageMenuRenderer": {
+        "header": {"activeAccountHeaderRenderer": header}}}}}]}
+
+
+def match(track_id, status, video_id=""):
+    return {**dict.fromkeys(yi.MATCH_FIELDS, ""), "yandex_id": track_id, "status": status,
+            "video_id": video_id}
 
 
 def apple_row(title, artist, duration, status="matched"):
@@ -251,6 +267,125 @@ class MatchCommandTest(InTempDir):
         rows = yi.load_matches()
         self.assertEqual(list(rows), ["10", "11"])
         self.assertEqual((rows["10"]["status"], rows["11"]["video_id"]), ("skip", "v11"))
+
+
+class LikeOrderTest(unittest.TestCase):
+    def test_newest_like_ends_last_and_playlist_only_songs_come_first(self):
+        # liked_tracks lists the newest like first; "10" is also in the playlist
+        order = yi.like_order(["10", "11"], [("Mix", ["12", "10"])],
+                              {"10": "v10", "11": "v11", "12": "v12"})
+        self.assertEqual(order, ["v12", "v11", "v10"])
+
+    def test_video_matched_twice_is_liked_at_its_latest_position(self):
+        order = yi.like_order(["10", "11", "12"], [("Mix", ["13"])],
+                              {"10": "vA", "11": "vB", "12": "vA", "13": "vA"})
+        self.assertEqual(order, ["vB", "vA"])
+
+    def test_unmatched_tracks_are_left_out(self):
+        self.assertEqual(yi.like_order(["10", "11"], [], {"11": "v11"}), ["v11"])
+
+
+@mock.patch("builtins.print")
+class ImportTest(InTempDir):
+    def setUp(self):
+        super().setUp()
+        write_csv("liked_tracks_me.csv", OK_HEADER, [
+            ["1", "New like", "A", "", "", "3:00", "10", "OK"],
+            ["2", "Old like", "A", "", "", "3:00", "11", "OK"],
+        ])
+        write_csv("playlist_me_Mix.csv", OK_HEADER, [
+            ["1", "Mix song", "B", "", "", "3:00", "12", "OK"],
+            ["2", "New like", "A", "", "", "3:00", "10", "OK"],
+            ["3", "Lost song", "C", "", "", "3:00", "13", "OK"],
+        ])
+        os.makedirs(yi.YT_DIR)
+        self.rows = {"10": match("10", "matched", "v10"), "11": match("11", "matched", "v11"),
+                     "12": match("12", "matched", "v12"), "13": match("13", "missing")}
+        yi.write_matches(self.rows)
+        self.fake = FakeYouTube()
+
+    def liked(self):
+        return [body["target"]["videoId"] for endpoint, body in self.fake.calls if endpoint == "like/like"]
+
+    def test_apply_likes_in_order_and_only_ever_calls_like(self, _print):
+        yi.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.liked(), ["v12", "v11", "v10"])
+        self.assertEqual({endpoint for endpoint, _ in self.fake.calls}, {"account/account_menu", "like/like"})
+        self.assertEqual(yi.load_state()["liked"], ["v12", "v11", "v10"])
+
+    def test_apply_refuses_while_rows_need_a_check(self, _print):
+        self.rows["13"] = match("13", "check", "v13")
+        yi.write_matches(self.rows)
+        with self.assertRaises(SystemExit):
+            yi.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_apply_refuses_while_tracks_are_unsearched(self, _print):
+        del self.rows["13"]
+        yi.write_matches(self.rows)
+        with self.assertRaises(SystemExit):
+            yi.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_rerun_continues_after_the_last_like(self, _print):
+        yi.save_state({"liked": ["v12"]})
+        yi.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.liked(), ["v11", "v10"])
+        self.assertEqual(yi.load_state()["liked"], ["v12", "v11", "v10"])
+
+    def test_failed_like_stops_the_run_and_keeps_progress(self, _print):
+        def call(endpoint, body):
+            if body.get("target", {}).get("videoId") == "v11":
+                raise yi.ApiError("like/like: HTTP 400")
+            return FakeYouTube.call(self.fake, endpoint, body)
+
+        self.fake.call = call
+        with self.assertRaises(yi.ApiError):
+            yi.cmd_import(self.fake, apply=True)
+        self.assertEqual(yi.load_state()["liked"], ["v12"])
+
+    def test_dry_run_likes_nothing_and_writes_the_report(self, _print):
+        yi.cmd_import(None, apply=False)
+        self.assertFalse(os.path.exists(yi.STATE_PATH))
+        report = yi.read_csv(yi.NOT_IMPORTED_PATH)
+        self.assertEqual([(r["yandex_id"], r["status"], r["in"]) for r in report], [("13", "missing", "Mix")])
+
+    def test_report_names_every_place_a_track_is_in(self, _print):
+        self.rows["10"] = match("10", "skip")
+        yi.write_matches(self.rows)
+        yi.cmd_import(None, apply=False)
+        report = {r["yandex_id"]: r["in"] for r in yi.read_csv(yi.NOT_IMPORTED_PATH)}
+        self.assertEqual(report["10"], "liked, Mix")
+
+
+class LoginTest(unittest.TestCase):
+    def test_cookie_without_sapisid_is_rejected_without_echoing_it(self):
+        with mock.patch.dict(os.environ, {"YTMUSIC_COOKIE": "SID=secretvalue"}):
+            with self.assertRaises(SystemExit) as raised:
+                yi.load_login()
+        self.assertNotIn("secretvalue", str(raised.exception.code))
+
+    def test_placeholder_cookie_is_rejected(self):
+        with mock.patch.dict(os.environ, {"YTMUSIC_COOKIE": "paste_here"}), self.assertRaises(SystemExit):
+            yi.load_login()
+
+    def test_copied_header_name_and_default_account_are_accepted(self):
+        env = {"YTMUSIC_COOKIE": "cookie: SAPISID=s; SID=x"}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("YTMUSIC_AUTHUSER", None)
+            self.assertEqual(yi.load_login(), ("SAPISID=s; SID=x", "0"))
+
+    def test_account_name_is_read_from_the_menu(self):
+        client = mock.Mock()
+        client.call.return_value = menu("Test User", "@testuser")
+        self.assertEqual(yi.account_name(client), "Test User (@testuser)")
+        self.assertEqual(client.call.call_args.args[0], "account/account_menu")
+
+    def test_signed_out_menu_raises(self):
+        client = mock.Mock()
+        client.call.return_value = {}
+        with self.assertRaises(yi.ApiError):
+            yi.account_name(client)
 
 
 if __name__ == "__main__":

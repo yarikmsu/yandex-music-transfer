@@ -9,17 +9,20 @@ Run in the export folder:
 Searches need no login. check and import --apply read the music.youtube.com cookie
 from YTMUSIC_COOKIE (and YTMUSIC_AUTHUSER when several Google accounts are signed in).
 """
+import collections
 import csv
 import hashlib
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
 
 from apple_import import (
     STATUS_RANK, ApiError, JsonClient, artist_similarity, classify, format_duration,
-    load_tracks, print_status_summary, progress, read_csv, score_candidate, similarity,
+    load_collections, load_tracks, print_status_summary, progress, read_csv, score_candidate,
+    similarity,
 )
 
 # YouTube Music has no public API; these are the calls its own web player makes,
@@ -52,6 +55,13 @@ MATCH_FIELDS = [
     "yandex_id", "title", "artist", "album", "duration", "status", "video_id", "youtube_type",
     "youtube_title", "youtube_artist", "youtube_album", "youtube_duration", "score",
 ]
+NOT_IMPORTED_FIELDS = [
+    "status", "title", "artist", "duration", "in",
+    "closest_title", "closest_artist", "closest_duration", "video_id", "yandex_id",
+]
+COOKIE_PLACEHOLDER = "paste_here"
+ACCOUNT_HEADER = ("actions", 0, "openPopupAction", "popup", "multiPageMenuRenderer", "header",
+                  "activeAccountHeaderRenderer")
 
 DURATION = re.compile(r"\d+(?::\d\d)+")
 VIDEO_TITLE_DASH = re.compile(r"\s[-–—]\s")
@@ -275,6 +285,57 @@ def write_matches(rows: dict[str, dict]) -> None:
     os.replace(tmp_path, MATCHES_PATH)
 
 
+def write_not_imported(matches: dict, video_ids: dict, liked: list[str], playlists: list) -> None:
+    """Every track that will not be liked, where it was, and the closest YouTube candidate."""
+    places = collections.defaultdict(list)
+    for track_id in liked:
+        places[track_id].append("liked")
+    for name, track_ids in playlists:
+        for track_id in track_ids:
+            places[track_id].append(name)
+    rows = [{
+        "status": row["status"], "title": row["title"], "artist": row["artist"],
+        "duration": row["duration"], "in": ", ".join(dict.fromkeys(places[track_id])),
+        "closest_title": row["youtube_title"], "closest_artist": row["youtube_artist"],
+        "closest_duration": row["youtube_duration"], "video_id": row["video_id"],
+        "yandex_id": track_id,
+    } for track_id, row in matches.items() if track_id not in video_ids]
+    tmp_path = NOT_IMPORTED_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=NOT_IMPORTED_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp_path, NOT_IMPORTED_PATH)
+
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_PATH):
+        return {"liked": []}
+    with open(STATE_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state: dict) -> None:
+    tmp_path = STATE_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp_path, STATE_PATH)
+
+
+def like_order(liked: list[str], playlists: list[tuple[str, list[str]]],
+               video_ids: dict[str, str]) -> list[str]:
+    """Video IDs in the order to like them.
+
+    Liked music lists the most recent like first, so tracks only in playlists go
+    first and liked tracks follow oldest first (the export lists the newest first).
+    A video that several tracks matched is liked once, at its last position.
+    """
+    liked_set = set(liked)
+    playlist_only = [t for _, track_ids in playlists for t in track_ids if t not in liked_set]
+    order = [video_ids[t] for t in playlist_only + list(reversed(liked)) if t in video_ids]
+    return list(reversed(dict.fromkeys(reversed(order))))
+
+
 # --- Commands ---
 
 def cmd_match(client: YouTubeMusicClient) -> None:
@@ -303,3 +364,101 @@ def search_tracks(client: YouTubeMusicClient, tracks: dict, apple: dict, done: d
             f.flush()
             if i % 25 == 0 or i == len(todo):
                 print(progress(i, len(todo), started, "searched"))
+
+
+def account_name(client: YouTubeMusicClient) -> str:
+    header = dig(client.call("account/account_menu", {}), *ACCOUNT_HEADER)
+    name = dig(header, "accountName", "runs", 0, "text")
+    if not name:
+        raise ApiError("the cookie is not signed in; copy it again from a signed-in "
+                       "music.youtube.com tab")
+    handle = dig(header, "channelHandle", "runs", 0, "text")
+    return f"{name} ({handle})" if handle else name
+
+
+def cmd_check(client: YouTubeMusicClient) -> None:
+    print(f"Cookie works. Signed in to YouTube Music as {account_name(client)}")
+
+
+def like_songs(client: YouTubeMusicClient, state: dict, songs: list[str]) -> None:
+    done = set(state["liked"])
+    pending = [s for s in songs if s not in done]
+    if state["liked"] and pending:
+        print(f"  {len(pending)} songs are new since the last import; "
+              "they will appear above the songs liked before.")
+    started = time.monotonic()
+    for i, video_id in enumerate(pending, 1):
+        client.call("like/like", {"target": {"videoId": video_id}})
+        state["liked"].append(video_id)
+        save_state(state)
+        if i % 50 == 0 or i == len(pending):
+            print(progress(i, len(pending), started, "liked"))
+    print(f"  Liked music: {len(state['liked'])} songs liked by this importer")
+
+
+def cmd_import(client: YouTubeMusicClient | None, apply: bool) -> None:
+    matches = load_matches()
+    if not matches:
+        sys.exit("Run 'match' first.")
+    liked, playlists = load_collections()
+    video_ids = {track_id: row["video_id"] for track_id, row in matches.items()
+                 if row["status"] == "matched" and row["video_id"]}
+    songs = like_order(liked, playlists, video_ids)
+    write_not_imported(matches, video_ids, liked, playlists)
+    unsearched = sum(track_id not in matches for track_id in load_tracks())
+    to_check = sum(row["status"] == "check" for row in matches.values())
+    print(f"Liked music: {len(songs)} songs from {len(liked)} liked tracks "
+          f"and {len(playlists)} playlists")
+    print(f"Not liked: {len(matches) - len(video_ids)} tracks, listed in {NOT_IMPORTED_PATH}")
+    if unsearched:
+        print(f"{unsearched} tracks are not searched yet: run 'match' again.")
+    if to_check:
+        print(f"{to_check} rows in {MATCHES_PATH} are still 'check': change each to "
+              "matched, missing or skip.")
+    if not apply:
+        print("Nothing changed. Run 'import --apply' to like these songs.")
+        return
+    if unsearched or to_check:
+        # Likes cannot be reordered later, so every track needs its decision first
+        sys.exit("Nothing liked: settle the tracks above first.")
+    print(f"Signed in as {account_name(client)}")
+    like_songs(client, load_state(), songs)
+    print("Done.")
+
+
+def load_login() -> tuple[str, str]:
+    """The cookie and Google account index; messages never include the cookie."""
+    cookie = os.environ.get("YTMUSIC_COOKIE", "").strip().strip("'\"")
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie[len("cookie:"):].strip()
+    if not cookie or cookie == COOKIE_PLACEHOLDER:
+        sys.exit("Set YTMUSIC_COOKIE first (see run/.ytmusic.env).")
+    if not sapisid_from(cookie):
+        sys.exit("YTMUSIC_COOKIE has no SAPISID value. Copy the whole cookie header of a "
+                 "request from a signed-in music.youtube.com tab.")
+    return cookie, os.environ.get("YTMUSIC_AUTHUSER", "").strip() or "0"
+
+
+def main(argv: list[str]) -> int:
+    command = argv[1] if len(argv) > 1 else ""
+    if command not in ("check", "match", "import"):
+        print(__doc__)
+        return 2
+    apply = "--apply" in argv[2:]
+    try:
+        if command == "match":
+            cmd_match(YouTubeMusicClient())
+            return 0
+        client = YouTubeMusicClient(*load_login()) if command == "check" or apply else None
+        if command == "check":
+            cmd_check(client)
+        else:
+            cmd_import(client, apply)
+    except ApiError as e:
+        print(f"YouTube Music error: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
