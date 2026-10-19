@@ -10,7 +10,8 @@ OUT="$BASE/out"
 # Only check and import --apply sign in; match and the dry run never see the cookie
 login=()
 if [[ "${1:-}" == "check" || " $* " == *" --apply "* ]]; then
-  if [[ ! -f "$ENV_FILE" ]] || grep -q 'paste_here' "$ENV_FILE"; then
+  # Comments mention the placeholder too, so only settings count
+  if [[ ! -f "$ENV_FILE" ]] || grep -q '^[^#]*paste_here' "$ENV_FILE"; then
     echo "Copy run/ytmusic.env.example to $ENV_FILE and put your music.youtube.com cookie into it." >&2
     exit 1
   fi

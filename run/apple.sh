@@ -7,7 +7,8 @@ BASE="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-$BASE/run/.apple.env}"
 OUT="$BASE/out"
 
-if [[ ! -f "$ENV_FILE" ]] || grep -q 'paste_here' "$ENV_FILE"; then
+# Comments mention the placeholder too, so only settings count
+if [[ ! -f "$ENV_FILE" ]] || grep -q '^[^#]*paste_here' "$ENV_FILE"; then
   echo "Copy run/apple.env.example to $ENV_FILE and put both Apple Music tokens into it." >&2
   exit 1
 fi
