@@ -1,17 +1,20 @@
-# Yandex Music to Apple Music
+# Yandex Music to Apple Music and YouTube Music
 
-Moves a Yandex Music library to Apple Music. It exports your liked tracks and
-playlists to CSV, finds each track in the Apple Music catalog, and adds the
-matches to your Apple Music Favorites. It can also recreate the playlists.
+Moves a Yandex Music library to Apple Music, YouTube Music, or both. It exports your
+liked tracks and playlists to CSV, finds each track in the other service's catalog,
+and adds the matches to your Apple Music Favorites or your YouTube Music Liked music.
+The Apple importer can also recreate the playlists.
 
-Both steps run on your machine in a locked-down Docker container, using only the
+Every step runs on your machine in a locked-down Docker container, using only the
 Python standard library.
 
 ## Requirements
 
 - Docker
-- A Yandex Music account and an Apple Music subscription
-- Chrome or another browser with developer tools, to copy the Apple Music tokens
+- A Yandex Music account
+- An Apple Music subscription, or a YouTube Music account (the free tier is enough)
+- Chrome or another browser with developer tools, to copy the Apple Music tokens or
+  the YouTube Music cookie
 
 ## 1. Export from Yandex Music
 
@@ -51,6 +54,33 @@ with one fix; see [exporter/README.md](exporter/README.md).
    explains the statuses, the `--playlists` option and how reruns work.
 3. Put `paste_here` back into `run/.apple.env` and sign out of music.apple.com.
 
+## 3. Import into YouTube Music
+
+This works with or without the Apple import. If `out/apple/matches.csv` exists, the
+songs you picked by hand there (originals instead of karaoke copies, other spellings)
+are looked for on YouTube too.
+
+1. Run:
+
+   ```
+   bash run/ytmusic.sh match            # no login needed: writes out/ytmusic/matches.csv
+   ```
+
+   Review `out/ytmusic/matches.csv`. Every `check` row needs a decision before
+   importing, because likes cannot be reordered afterwards;
+   [importer/YOUTUBE_MUSIC.md](importer/YOUTUBE_MUSIC.md) explains the statuses.
+2. `cp run/ytmusic.env.example run/.ytmusic.env` and paste the cookie of a signed-in
+   music.youtube.com session into it; [importer/YOUTUBE_MUSIC.md](importer/YOUTUBE_MUSIC.md)
+   shows where to find it. Then run:
+
+   ```
+   bash run/ytmusic.sh check            # cookie works? shows the account
+   bash run/ytmusic.sh import           # dry run
+   bash run/ytmusic.sh import --apply   # like the matched songs
+   ```
+
+3. Put `paste_here` back into `run/.ytmusic.env` and sign out of music.youtube.com.
+
 ## Safety
 
 - The container has a read-only file system, no Linux capabilities and no
@@ -58,15 +88,18 @@ with one fix; see [exporter/README.md](exporter/README.md).
   and `out/`.
 - `run/run.sh` refuses to run if the exporter differs from the reviewed version.
 - Tokens arrive through env files, never on the command line. `run/.env`,
-  `run/.apple.env` and `out/` (your library) are git-ignored.
+  `run/.apple.env`, `run/.ytmusic.env` and `out/` (your library) are git-ignored.
 - The Apple Music tokens are sent only to Apple Music. Catalog searches go to the
   public iTunes Search API with no tokens at all.
-- Neither service officially supports access this way, so either may block it
-  at any time.
+- The YouTube Music cookie is a full Google login. It reaches the container only for
+  `check` and `import --apply` and is sent only to music.youtube.com; searches go
+  without it. The importer only ever likes songs: it never unlikes or removes anything.
+- None of these services officially supports access this way, so any of them may
+  block it at any time.
 
 ## Tests
 
-The importer's unit tests run offline:
+The importers' unit tests run offline:
 
 ```
 docker run --rm --network none -v "$PWD/importer:/app:ro" -w /app python:3.13-slim python -B -m unittest
