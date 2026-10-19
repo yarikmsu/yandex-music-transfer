@@ -62,7 +62,9 @@ To hear a candidate, open `https://music.youtube.com/watch?v=<video_id>`. To lik
 row, change its status to `matched`. To use a different song, paste the `v=` part of its
 music.youtube.com link into `video_id`. To leave a track out, set its status to `missing`
 or `skip`; reruns of `match` never touch rows already in the file. Keep the file as
-UTF-8 CSV when saving.
+UTF-8 CSV when saving. Spreadsheet apps such as Excel read a video ID that starts with
+`-` as a formula and save it as `#NAME?`, so edit the file in a text editor, or import
+the `video_id` column as text.
 
 `import --apply` refuses to start while any row is still `check`, a track has not been
 searched yet, or an edited row has an unknown status or a `video_id` that is not
