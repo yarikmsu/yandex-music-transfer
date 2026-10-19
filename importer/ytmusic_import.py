@@ -9,13 +9,18 @@ Run in the export folder:
 Searches need no login. check and import --apply read the music.youtube.com cookie
 from YTMUSIC_COOKIE (and YTMUSIC_AUTHUSER when several Google accounts are signed in).
 """
+import csv
 import hashlib
 import json
+import os
 import re
 import time
 import urllib.request
 
-from apple_import import ApiError, JsonClient
+from apple_import import (
+    STATUS_RANK, ApiError, JsonClient, artist_similarity, classify, format_duration,
+    load_tracks, print_status_summary, progress, read_csv, score_candidate, similarity,
+)
 
 # YouTube Music has no public API; these are the calls its own web player makes,
 # as documented by ytmusicapi (github.com/sigma67/ytmusicapi)
@@ -36,6 +41,17 @@ GREYED_OUT = "MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT"
 # Google account, and a burst of them is more likely to look like abuse.
 SEARCH_PAUSE = 1.5
 LIKE_PAUSE = 3.0
+
+YT_DIR = "ytmusic"
+MATCHES_PATH = os.path.join(YT_DIR, "matches.csv")
+STATE_PATH = os.path.join(YT_DIR, "state.json")
+NOT_IMPORTED_PATH = os.path.join(YT_DIR, "not_imported.csv")
+# The reviewed Apple Music matches, when that import was done first
+APPLE_MATCHES_PATH = os.path.join("apple", "matches.csv")
+MATCH_FIELDS = [
+    "yandex_id", "title", "artist", "album", "duration", "status", "video_id", "youtube_type",
+    "youtube_title", "youtube_artist", "youtube_album", "youtube_duration", "score",
+]
 
 DURATION = re.compile(r"\d+(?::\d\d)+")
 VIDEO_TITLE_DASH = re.compile(r"\s[-–—]\s")
@@ -166,3 +182,124 @@ def parse_search(response: dict) -> list[dict]:
 def search(client: YouTubeMusicClient, query: str, kind: str) -> list[dict]:
     """Songs (kind=SONGS) or videos (kind=VIDEOS) YouTube Music finds for the query."""
     return parse_search(client.call("search", {"query": query, "params": kind}))
+
+
+# --- Matching ---
+
+def reference(track: dict, apple_row: dict | None) -> dict:
+    """What to look for: the reviewed Apple song where the review changed the names.
+
+    There the user (or the Apple importer's cover pass) chose another recording or
+    spelling, such as the original for a karaoke copy, so that choice carries over.
+    """
+    if not apple_row or apple_row["status"] != "matched":
+        return track
+    renamed = (artist_similarity(track["artist"], apple_row["apple_artist"]) < 0.8
+               or similarity(track["title"], apple_row["apple_title"]) < 0.85)
+    if not renamed:
+        return track
+    return {"title": apple_row["apple_title"], "artist": apple_row["apple_artist"],
+            "album": apple_row["apple_album"], "duration": apple_row["apple_duration"]}
+
+
+def status_of(scores: dict, song: dict) -> str:
+    # A video is never imported unreviewed, however well it matches
+    status = classify(scores)
+    return "check" if status == "matched" and song["type"] != "song" else status
+
+
+def _rank(best: tuple[dict, dict, str]) -> tuple[int, float]:
+    return STATUS_RANK[best[2]], best[1]["total"]
+
+
+def best_of(reference: dict, candidates: list[dict]) -> tuple[dict, dict, str] | None:
+    scored = []
+    for song in candidates:
+        scores = score_candidate(reference, song)
+        scored.append((song, scores, status_of(scores, song)))
+    return max(scored, key=_rank, default=None)
+
+
+def find_match(client: YouTubeMusicClient, reference: dict) -> tuple[dict, dict, str] | None:
+    """Songs by title and artist, then by title alone, then videos; stops at a match."""
+    with_artist = f"{reference['title']} {reference['artist'].split(', ')[0]}"
+    best = None
+    for query, kind in ((with_artist, SONGS), (reference["title"], SONGS), (with_artist, VIDEOS)):
+        found = [b for b in (best, best_of(reference, search(client, query, kind))) if b]
+        best = max(found, key=_rank, default=None)
+        if best and best[2] == "matched":
+            break
+    return best
+
+
+def match_row(track_id: str, track: dict, best) -> dict:
+    row = dict.fromkeys(MATCH_FIELDS, "")
+    row.update(yandex_id=track_id, status="missing", **track)
+    if best is None:
+        return row
+    song, scores, status = best
+    attrs = song["attributes"]
+    row.update(
+        status=status,
+        video_id=song["id"],
+        youtube_type=song["type"],
+        youtube_title=attrs["name"],
+        youtube_artist=attrs["artistName"],
+        youtube_album=attrs["albumName"],
+        youtube_duration=format_duration(attrs["durationInMillis"]),
+        score=f"{scores['total']:.2f}",
+    )
+    return row
+
+
+# --- Local files ---
+
+def load_apple_matches() -> dict[str, dict]:
+    if not os.path.exists(APPLE_MATCHES_PATH):
+        return {}
+    return {row["yandex_id"]: row for row in read_csv(APPLE_MATCHES_PATH)}
+
+
+def load_matches() -> dict[str, dict]:
+    if not os.path.exists(MATCHES_PATH):
+        return {}
+    return {row["yandex_id"]: row for row in read_csv(MATCHES_PATH)}
+
+
+def write_matches(rows: dict[str, dict]) -> None:
+    tmp_path = MATCHES_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MATCH_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows.values())
+    os.replace(tmp_path, MATCHES_PATH)
+
+
+# --- Commands ---
+
+def cmd_match(client: YouTubeMusicClient) -> None:
+    tracks = load_tracks()
+    done = load_matches()
+    search_tracks(client, tracks, load_apple_matches(), done)
+    print_status_summary(done.values())
+
+
+def search_tracks(client: YouTubeMusicClient, tracks: dict, apple: dict, done: dict) -> None:
+    """Search every track not yet in matches.csv, adding rows to it and to done."""
+    todo = [(track_id, track) for track_id, track in tracks.items() if track_id not in done]
+    print(f"{len(tracks)} tracks, {len(todo)} left to search")
+    os.makedirs(YT_DIR, exist_ok=True)
+    write_header = not os.path.exists(MATCHES_PATH)
+    started = time.monotonic()
+    # Appending row by row means an interrupted run resumes where it stopped
+    with open(MATCHES_PATH, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MATCH_FIELDS)
+        if write_header:
+            writer.writeheader()
+        for i, (track_id, track) in enumerate(todo, 1):
+            best = find_match(client, reference(track, apple.get(track_id)))
+            done[track_id] = match_row(track_id, track, best)
+            writer.writerow(done[track_id])
+            f.flush()
+            if i % 25 == 0 or i == len(todo):
+                print(progress(i, len(todo), started, "searched"))

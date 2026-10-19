@@ -1,11 +1,15 @@
+import csv
 import hashlib
 import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
 import ytmusic_import as yi
 
 DOT = {"text": " • "}
+OK_HEADER = ["#", "Title", "Artist", "Album", "Year", "Duration", "ID", "Availability"]
 
 
 def run(text, browse_id=None):
@@ -56,6 +60,51 @@ def http_ok(payload):
     ok = mock.MagicMock()
     ok.__enter__.return_value.read.return_value = json.dumps(payload).encode()
     return ok
+
+
+def track(title, artist, duration="3:31", album=""):
+    return {"title": title, "artist": artist, "album": album, "duration": duration}
+
+
+def song_item(title, artist, duration, video_id, video_type=yi.OFFICIAL_TRACK):
+    return item(title, meta([run(artist, "UC1")], duration), video_id, video_type)
+
+
+def write_csv(path, header, rows):
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+class FakeYouTube:
+    """Answers searches from `answers`, keyed by (query, filter), and records every call."""
+
+    def __init__(self, answers=None):
+        self.answers = answers or {}
+        self.calls = []
+
+    def call(self, endpoint, body):
+        self.calls.append((endpoint, body))
+        if endpoint == "search":
+            return response(*self.answers.get((body["query"], body["params"]), []))
+        return {}
+
+    def queries(self):
+        return [body["query"] for endpoint, body in self.calls if endpoint == "search"]
+
+
+class InTempDir(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(tmp.name)
+
+
+def apple_row(title, artist, duration, status="matched"):
+    return {"status": status, "apple_title": title, "apple_artist": artist,
+            "apple_album": "", "apple_duration": duration}
 
 
 class SearchParsingTest(unittest.TestCase):
@@ -143,6 +192,65 @@ class ClientTest(unittest.TestCase):
         with mock.patch.object(yi.urllib.request, "urlopen", return_value=page) as urlopen:
             self.assertEqual(yi.visitor_id(), "Cgt2aXNpdG9y")
         self.assertIsNone(urlopen.call_args.args[0].get_header("Cookie"))
+
+
+class MatchTest(unittest.TestCase):
+    def test_official_track_with_same_length_is_matched_from_the_first_search(self):
+        fake = FakeYouTube({("Линия жизни Сплин", yi.SONGS): [
+            song_item("Линия жизни", "Сплин", "3:03", "crhhkg7vHoM")]})
+        song, _, status = yi.find_match(fake, track("Линия жизни", "Сплин", "3:02"))
+        self.assertEqual((song["id"], status), ("crhhkg7vHoM", "matched"))
+        self.assertEqual(fake.queries(), ["Линия жизни Сплин"])
+
+    def test_video_is_never_more_than_check(self):
+        fake = FakeYouTube({("Линия жизни Сплин", yi.VIDEOS): [
+            song_item("Сплин - Линия жизни", "Fan Channel", "3:02", "ugc1", "MUSIC_VIDEO_TYPE_UGC")]})
+        exported = track("Линия жизни", "Сплин", "3:02")
+        row = yi.match_row("10", exported, yi.find_match(fake, exported))
+        self.assertEqual((row["status"], row["youtube_type"], row["video_id"]), ("check", "video", "ugc1"))
+        self.assertEqual(len(fake.queries()), 3)
+
+    def test_reviewed_apple_original_is_searched_instead_of_the_karaoke_copy(self):
+        exported = track("Shoot To Thrill (Made Famous By AC/DC)", "Iron Man", "5:20")
+        reference = yi.reference(exported, apple_row("Shoot to Thrill", "AC/DC", "5:17"))
+        fake = FakeYouTube({("Shoot to Thrill AC/DC", yi.SONGS): [
+            song_item("Shoot to Thrill", "AC/DC", "5:18", "orig")]})
+        song, _, status = yi.find_match(fake, reference)
+        self.assertEqual(fake.queries()[0], "Shoot to Thrill AC/DC")
+        self.assertEqual((song["id"], status), ("orig", "matched"))
+
+    def test_same_names_on_apple_keep_the_export_reference(self):
+        exported = track("Линия жизни", "Сплин", "3:02")
+        self.assertIs(yi.reference(exported, apple_row("Линия жизни", "Сплин", "3:03")), exported)
+
+    def test_unreviewed_apple_row_is_ignored(self):
+        exported = track("Shoot To Thrill (Made Famous By AC/DC)", "Iron Man")
+        row = apple_row("Shoot to Thrill", "AC/DC", "5:17", status="check")
+        self.assertIs(yi.reference(exported, row), exported)
+        self.assertIs(yi.reference(exported, None), exported)
+
+    def test_nothing_found_is_missing(self):
+        fake = FakeYouTube()
+        row = yi.match_row("10", track("Unknown", "Nobody"), yi.find_match(fake, track("Unknown", "Nobody")))
+        self.assertEqual((row["status"], row["video_id"]), ("missing", ""))
+        self.assertEqual(row["title"], "Unknown")
+
+
+class MatchCommandTest(InTempDir):
+    @mock.patch("builtins.print")
+    def test_match_resumes_without_searching_done_tracks(self, _print):
+        write_csv("liked_tracks_me.csv", OK_HEADER, [
+            ["1", "Done", "A", "", "", "3:00", "10", "OK"],
+            ["2", "Linia", "B", "", "", "3:00", "11", "OK"],
+        ])
+        os.makedirs(yi.YT_DIR)
+        yi.write_matches({"10": {**dict.fromkeys(yi.MATCH_FIELDS, ""), "yandex_id": "10", "status": "skip"}})
+        fake = FakeYouTube({("Linia B", yi.SONGS): [song_item("Linia", "B", "3:00", "v11")]})
+        yi.cmd_match(fake)
+        self.assertEqual(fake.queries(), ["Linia B"])
+        rows = yi.load_matches()
+        self.assertEqual(list(rows), ["10", "11"])
+        self.assertEqual((rows["10"]["status"], rows["11"]["video_id"]), ("skip", "v11"))
 
 
 if __name__ == "__main__":
