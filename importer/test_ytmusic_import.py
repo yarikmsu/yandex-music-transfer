@@ -113,6 +113,11 @@ def menu(name, handle=None):
         "header": {"activeAccountHeaderRenderer": header}}}}}]}
 
 
+def vid(n):
+    """A video ID in YouTube's 11-character format."""
+    return f"video{n:06d}"
+
+
 def match(track_id, status, video_id=""):
     return {**dict.fromkeys(yi.MATCH_FIELDS, ""), "yandex_id": track_id, "status": status,
             "video_id": video_id}
@@ -239,6 +244,10 @@ class MatchTest(unittest.TestCase):
         exported = track("Линия жизни", "Сплин", "3:02")
         self.assertIs(yi.reference(exported, apple_row("Линия жизни", "Сплин", "3:03")), exported)
 
+    def test_apple_row_without_names_keeps_the_export_reference(self):
+        exported = track("Shoot To Thrill (Made Famous By AC/DC)", "Iron Man")
+        self.assertIs(yi.reference(exported, apple_row("", "", "")), exported)
+
     def test_unreviewed_apple_row_is_ignored(self):
         exported = track("Shoot To Thrill (Made Famous By AC/DC)", "Iron Man")
         row = apple_row("Shoot to Thrill", "AC/DC", "5:17", status="check")
@@ -299,8 +308,8 @@ class ImportTest(InTempDir):
             ["3", "Lost song", "C", "", "", "3:00", "13", "OK"],
         ])
         os.makedirs(yi.YT_DIR)
-        self.rows = {"10": match("10", "matched", "v10"), "11": match("11", "matched", "v11"),
-                     "12": match("12", "matched", "v12"), "13": match("13", "missing")}
+        self.rows = {"10": match("10", "matched", vid(10)), "11": match("11", "matched", vid(11)),
+                     "12": match("12", "matched", vid(12)), "13": match("13", "missing")}
         yi.write_matches(self.rows)
         self.fake = FakeYouTube()
 
@@ -309,12 +318,12 @@ class ImportTest(InTempDir):
 
     def test_apply_likes_in_order_and_only_ever_calls_like(self, _print):
         yi.cmd_import(self.fake, apply=True)
-        self.assertEqual(self.liked(), ["v12", "v11", "v10"])
+        self.assertEqual(self.liked(), [vid(12), vid(11), vid(10)])
         self.assertEqual({endpoint for endpoint, _ in self.fake.calls}, {"account/account_menu", "like/like"})
-        self.assertEqual(yi.load_state()["liked"], ["v12", "v11", "v10"])
+        self.assertEqual(yi.load_state()["liked"], [vid(12), vid(11), vid(10)])
 
     def test_apply_refuses_while_rows_need_a_check(self, _print):
-        self.rows["13"] = match("13", "check", "v13")
+        self.rows["13"] = match("13", "check", vid(13))
         yi.write_matches(self.rows)
         with self.assertRaises(SystemExit):
             yi.cmd_import(self.fake, apply=True)
@@ -327,22 +336,37 @@ class ImportTest(InTempDir):
             yi.cmd_import(self.fake, apply=True)
         self.assertEqual(self.fake.calls, [])
 
+    def test_apply_refuses_an_unknown_status(self, _print):
+        self.rows["12"] = match("12", "Matched", vid(12))
+        yi.write_matches(self.rows)
+        with self.assertRaises(SystemExit):
+            yi.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_apply_refuses_a_matched_row_without_a_valid_video_id(self, _print):
+        for bad in ("", "https://music.youtube.com/watch?v=v12v12v12v1"):
+            self.rows["12"] = match("12", "matched", bad)
+            yi.write_matches(self.rows)
+            with self.assertRaises(SystemExit):
+                yi.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.calls, [])
+
     def test_rerun_continues_after_the_last_like(self, _print):
-        yi.save_state({"liked": ["v12"]})
+        yi.save_state({"liked": [vid(12)]})
         yi.cmd_import(self.fake, apply=True)
-        self.assertEqual(self.liked(), ["v11", "v10"])
-        self.assertEqual(yi.load_state()["liked"], ["v12", "v11", "v10"])
+        self.assertEqual(self.liked(), [vid(11), vid(10)])
+        self.assertEqual(yi.load_state()["liked"], [vid(12), vid(11), vid(10)])
 
     def test_failed_like_stops_the_run_and_keeps_progress(self, _print):
         def call(endpoint, body):
-            if body.get("target", {}).get("videoId") == "v11":
+            if body.get("target", {}).get("videoId") == vid(11):
                 raise yi.ApiError("like/like: HTTP 400")
             return FakeYouTube.call(self.fake, endpoint, body)
 
         self.fake.call = call
         with self.assertRaises(yi.ApiError):
             yi.cmd_import(self.fake, apply=True)
-        self.assertEqual(yi.load_state()["liked"], ["v12"])
+        self.assertEqual(yi.load_state()["liked"], [vid(12)])
 
     def test_dry_run_likes_nothing_and_writes_the_report(self, _print):
         yi.cmd_import(None, apply=False)
@@ -361,6 +385,12 @@ class ImportTest(InTempDir):
 class LoginTest(unittest.TestCase):
     def test_cookie_without_sapisid_is_rejected_without_echoing_it(self):
         with mock.patch.dict(os.environ, {"YTMUSIC_COOKIE": "SID=secretvalue"}):
+            with self.assertRaises(SystemExit) as raised:
+                yi.load_login()
+        self.assertNotIn("secretvalue", str(raised.exception.code))
+
+    def test_cookie_with_a_line_break_is_rejected_without_echoing_it(self):
+        with mock.patch.dict(os.environ, {"YTMUSIC_COOKIE": "SAPISID=s;\rSID=secretvalue"}):
             with self.assertRaises(SystemExit) as raised:
                 yi.load_login()
         self.assertNotIn("secretvalue", str(raised.exception.code))

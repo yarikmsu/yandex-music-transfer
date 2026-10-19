@@ -60,8 +60,10 @@ music.youtube.com link into `video_id`. To leave a track out, set its status to 
 or `skip`; reruns of `match` never touch rows already in the file. Keep the file as
 UTF-8 CSV when saving.
 
-`import --apply` refuses to start while any row is still `check` or a track has not been
-searched yet, because likes cannot be reordered afterwards (see below).
+`import --apply` refuses to start while any row is still `check`, a track has not been
+searched yet, or an edited row has an unknown status or a `video_id` that is not
+11 characters long, because likes cannot be reordered afterwards (see below). The dry run
+lists those rows.
 
 ## Order
 

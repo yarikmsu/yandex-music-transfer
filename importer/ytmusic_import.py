@@ -59,6 +59,8 @@ NOT_IMPORTED_FIELDS = [
     "status", "title", "artist", "duration", "in",
     "closest_title", "closest_artist", "closest_duration", "video_id", "yandex_id",
 ]
+STATUSES = ("matched", "check", "missing", "skip")
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 COOKIE_PLACEHOLDER = "paste_here"
 ACCOUNT_HEADER = ("actions", 0, "openPopupAction", "popup", "multiPageMenuRenderer", "header",
                   "activeAccountHeaderRenderer")
@@ -204,6 +206,8 @@ def reference(track: dict, apple_row: dict | None) -> dict:
     """
     if not apple_row or apple_row["status"] != "matched":
         return track
+    if not (apple_row["apple_title"].strip() and apple_row["apple_artist"].strip()):
+        return track  # an ID pasted into a row without names: nothing to search for
     renamed = (artist_similarity(track["artist"], apple_row["apple_artist"]) < 0.8
                or similarity(track["title"], apple_row["apple_title"]) < 0.85)
     if not renamed:
@@ -396,31 +400,48 @@ def like_songs(client: YouTubeMusicClient, state: dict, songs: list[str]) -> Non
     print(f"  Liked music: {len(state['liked'])} songs liked by this importer")
 
 
+def blockers(tracks: dict, matches: dict) -> list[str]:
+    """What keeps import --apply from liking anything yet, one message per problem."""
+    problems = []
+    unsearched = sum(track_id not in matches for track_id in tracks)
+    if unsearched:
+        problems.append(f"{unsearched} tracks are not searched yet: run 'match' again.")
+    to_check = sum(row["status"] == "check" for row in matches.values())
+    if to_check:
+        problems.append(f"{to_check} rows in {MATCHES_PATH} are still 'check': change each to "
+                        "matched, missing or skip.")
+    # A typo would silently leave an approved song out, and adding it later puts it on top
+    for row in matches.values():
+        where = f"Row {row['yandex_id']} ({row['title']})"
+        if row["status"] not in STATUSES:
+            problems.append(f"{where}: unknown status '{row['status']}'.")
+        elif row["status"] == "matched" and not VIDEO_ID.fullmatch(row["video_id"]):
+            problems.append(f"{where}: '{row['video_id']}' is not a video ID "
+                            "(the 11 characters after v= in its link).")
+    return problems
+
+
 def cmd_import(client: YouTubeMusicClient | None, apply: bool) -> None:
     matches = load_matches()
     if not matches:
         sys.exit("Run 'match' first.")
     liked, playlists = load_collections()
     video_ids = {track_id: row["video_id"] for track_id, row in matches.items()
-                 if row["status"] == "matched" and row["video_id"]}
+                 if row["status"] == "matched" and VIDEO_ID.fullmatch(row["video_id"])}
     songs = like_order(liked, playlists, video_ids)
     write_not_imported(matches, video_ids, liked, playlists)
-    unsearched = sum(track_id not in matches for track_id in load_tracks())
-    to_check = sum(row["status"] == "check" for row in matches.values())
     print(f"Liked music: {len(songs)} songs from {len(liked)} liked tracks "
           f"and {len(playlists)} playlists")
     print(f"Not liked: {len(matches) - len(video_ids)} tracks, listed in {NOT_IMPORTED_PATH}")
-    if unsearched:
-        print(f"{unsearched} tracks are not searched yet: run 'match' again.")
-    if to_check:
-        print(f"{to_check} rows in {MATCHES_PATH} are still 'check': change each to "
-              "matched, missing or skip.")
+    problems = blockers(load_tracks(), matches)
+    for problem in problems:
+        print(problem)
     if not apply:
         print("Nothing changed. Run 'import --apply' to like these songs.")
         return
-    if unsearched or to_check:
+    if problems:
         # Likes cannot be reordered later, so every track needs its decision first
-        sys.exit("Nothing liked: settle the tracks above first.")
+        sys.exit("Nothing liked: settle the rows above first.")
     print(f"Signed in as {account_name(client)}")
     like_songs(client, load_state(), songs)
     print("Done.")
@@ -433,6 +454,10 @@ def load_login() -> tuple[str, str]:
         cookie = cookie[len("cookie:"):].strip()
     if not cookie or cookie == COOKIE_PLACEHOLDER:
         sys.exit("Set YTMUSIC_COOKIE first (see run/.ytmusic.env).")
+    # Python would refuse to send such a header and print it, whole, in the error
+    if not (cookie.isascii() and cookie.isprintable()):
+        sys.exit("YTMUSIC_COOKIE contains a line break or another unusual character. "
+                 "Copy it again, as one line.")
     if not sapisid_from(cookie):
         sys.exit("YTMUSIC_COOKIE has no SAPISID value. Copy the whole cookie header of a "
                  "request from a signed-in music.youtube.com tab.")
