@@ -43,14 +43,16 @@ by title alone, then among videos. The best candidate is compared on title, arti
 (Cyrillic and Latin spellings both count) and length, the same way the Apple importer
 does. Where your reviewed Apple matches in `out/apple/matches.csv` name another artist or
 title, for example the original instead of a karaoke copy, YouTube is searched for that
-Apple song instead, so your review carries over.
+Apple song instead, so your review carries over. An Apple match that is itself a karaoke
+or tribute copy ("as made famous by ...") of a track that is not is ignored.
 
 The `status` in `matches.csv` is:
 
 - `matched`: an official album track whose title and artist agree and whose length is
   within 10 seconds; it will be liked
-- `check`: a likely candidate, but something differs, or YouTube has only a video of it
-  (`youtube_type` is `video`: a music video, live recording or fan upload). Videos are
+- `check`: a likely candidate, but something differs, YouTube has only a video of it
+  (`youtube_type` is `video`: a music video, live recording or fan upload), or the
+  candidate is a karaoke or tribute copy while your track is not. Videos and copies are
   never liked unless you approve them
 - `missing`: nothing close; not liked
 

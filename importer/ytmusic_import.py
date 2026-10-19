@@ -20,7 +20,7 @@ import time
 import urllib.request
 
 from apple_import import (
-    STATUS_RANK, ApiError, JsonClient, artist_similarity, classify, format_duration,
+    COVER_OF, STATUS_RANK, ApiError, JsonClient, artist_similarity, classify, format_duration,
     load_collections, load_tracks, print_status_summary, progress, read_csv, score_candidate,
     similarity,
 )
@@ -68,6 +68,9 @@ ACCOUNT_HEADER = ("actions", 0, "openPopupAction", "popup", "multiPageMenuRender
 DURATION = re.compile(r"\d+(?::\d\d)+")
 VIDEO_TITLE_DASH = re.compile(r"\s[-–—]\s")
 YTCFG = re.compile(r"ytcfg\.set\s*\(\s*({.+?})\s*\)\s*;")
+# Karaoke labels often credit the original artist, as "Scott McKenzie (Karaoke)",
+# so the artist score alone does not tell the copy from the original
+KARAOKE = re.compile(r"karaoke|караоке", re.IGNORECASE)
 
 
 # --- YouTube Music API ---
@@ -208,7 +211,10 @@ def reference(track: dict, apple_row: dict | None) -> dict:
         return track
     if not (apple_row["apple_title"].strip() and apple_row["apple_artist"].strip()):
         return track  # an ID pasted into a row without names: nothing to search for
-    renamed = (artist_similarity(track["artist"], apple_row["apple_artist"]) < 0.8
+    apple = (apple_row["apple_title"], apple_row["apple_artist"], apple_row["apple_album"])
+    if is_copy(*apple) and not is_copy(track["title"], track["artist"], track["album"]):
+        return track  # the review let a karaoke or tribute copy through
+    renamed =(artist_similarity(track["artist"], apple_row["apple_artist"]) < 0.8
                or similarity(track["title"], apple_row["apple_title"]) < 0.85)
     if not renamed:
         return track
@@ -216,10 +222,21 @@ def reference(track: dict, apple_row: dict | None) -> dict:
             "album": apple_row["apple_album"], "duration": apple_row["apple_duration"]}
 
 
-def status_of(scores: dict, song: dict) -> str:
-    # A video is never imported unreviewed, however well it matches
+def is_copy(title: str, artist: str, album: str) -> bool:
+    """Whether the names mark a karaoke or tribute copy of someone else's song."""
+    return bool(COVER_OF.search(title) or KARAOKE.search(f"{title} {artist} {album}"))
+
+
+def status_of(scores: dict, song: dict, reference: dict) -> str:
+    # Videos and karaoke or tribute copies are never imported unreviewed, however
+    # well they match, unless the exported track is such a copy itself
     status = classify(scores)
-    return "check" if status == "matched" and song["type"] != "song" else status
+    if status != "matched":
+        return status
+    attrs = song["attributes"]
+    copy = (is_copy(attrs["name"], attrs["artistName"], attrs["albumName"])
+            and not is_copy(reference["title"], reference["artist"], reference["album"]))
+    return "check" if song["type"] != "song" or copy else status
 
 
 def _rank(best: tuple[dict, dict, str]) -> tuple[int, float]:
@@ -230,7 +247,7 @@ def best_of(reference: dict, candidates: list[dict]) -> tuple[dict, dict, str] |
     scored = []
     for song in candidates:
         scores = score_candidate(reference, song)
-        scored.append((song, scores, status_of(scores, song)))
+        scored.append((song, scores, status_of(scores, song, reference)))
     return max(scored, key=_rank, default=None)
 
 

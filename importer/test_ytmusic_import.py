@@ -231,6 +231,32 @@ class MatchTest(unittest.TestCase):
         self.assertEqual((row["status"], row["youtube_type"], row["video_id"]), ("check", "video", "ugc1"))
         self.assertEqual(len(fake.queries()), 3)
 
+    def test_karaoke_copy_credited_to_the_original_artist_is_only_check(self):
+        copy = yt_song(vid(1), "San Francisco", "Scott McKenzie (Karaoke)", 174000,
+                       "Zoom Karaoke Golden Years 1967")
+        exported = track("San Francisco", "Scott McKenzie", "2:53")
+        self.assertEqual(yi.best_of(exported, [copy])[2], "check")
+        original = yt_song(vid(2), "San Francisco", "Scott McKenzie", 178000, "The Voice of Scott McKenzie")
+        self.assertEqual(yi.best_of(exported, [copy, original])[0]["id"], vid(2))
+
+    def test_tribute_copy_is_only_check(self):
+        copy = yt_song(vid(1), "St. Anger (As Made Famous By Metallica)", "Metallica", 440000)
+        self.assertEqual(yi.best_of(track("St. Anger", "Metallica", "7:21"), [copy])[2], "check")
+
+    def test_exported_karaoke_copy_can_match_itself(self):
+        exported = track("Shoot To Thrill (Made Famous By AC/DC)", "Iron Man", "5:20")
+        copy = yt_song(vid(1), "Shoot To Thrill (Made Famous By AC/DC)", "Iron Man", 320000)
+        self.assertEqual(yi.best_of(exported, [copy])[2], "matched")
+
+    def test_apple_review_that_kept_a_tribute_copy_is_ignored(self):
+        exported = track("St. Anger", "Metallica", "7:21")
+        tribute = apple_row("St. Anger (as made famous by Metallica)", "Metal Militia", "7:19")
+        self.assertIs(yi.reference(exported, tribute), exported)
+        exported = track("San Francisco", "Scott McKenzie", "2:53")
+        karaoke = apple_row("San Francisco (Be Sure To Wear Some Flowers In Your Hair)",
+                            "Scott McKenzie (Karaoke)", "2:54")
+        self.assertIs(yi.reference(exported, karaoke), exported)
+
     def test_reviewed_apple_original_is_searched_instead_of_the_karaoke_copy(self):
         exported = track("Shoot To Thrill (Made Famous By AC/DC)", "Iron Man", "5:20")
         reference = yi.reference(exported, apple_row("Shoot to Thrill", "AC/DC", "5:17"))
