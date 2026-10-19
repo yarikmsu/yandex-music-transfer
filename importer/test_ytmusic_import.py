@@ -223,15 +223,29 @@ class MatchTest(unittest.TestCase):
         self.assertEqual((song["id"], status), ("crhhkg7vHoM", "matched"))
         self.assertEqual(fake.queries(), ["Линия жизни Сплин"])
 
-    def test_video_is_never_more_than_check(self):
+    def test_video_of_the_same_song_is_matched_when_no_track_is_found(self):
         fake = FakeYouTube({("Линия жизни Сплин", yi.VIDEOS): [
             song_item("Сплин - Линия жизни", "Fan Channel", "3:02", "ugc1", "MUSIC_VIDEO_TYPE_UGC")]})
         exported = track("Линия жизни", "Сплин", "3:02")
         row = yi.match_row("10", exported, yi.find_match(fake, exported))
-        self.assertEqual((row["status"], row["youtube_type"], row["video_id"]), ("check", "video", "ugc1"))
+        self.assertEqual((row["status"], row["youtube_type"], row["video_id"]), ("matched", "video", "ugc1"))
         self.assertEqual(len(fake.queries()), 3)
 
-    def test_album_track_of_another_length_beats_a_closer_video(self):
+    def test_same_title_and_artist_is_matched_whatever_the_length(self):
+        live = yt_song(vid(1), "Enter Sandman", "Metallica", 332000)
+        self.assertEqual(yi.best_of(track("Enter Sandman", "Metallica", "4:02"), [live])[2], "matched")
+
+    def test_another_artist_with_the_same_title_is_only_check(self):
+        cover = yt_song(vid(1), "Старый дом", "Sinety", 161000)
+        self.assertEqual(yi.best_of(track("Старый дом", "Сплин", "2:39"), [cover])[2], "check")
+
+    def test_cover_marks_a_fan_video_but_not_an_official_track(self):
+        fan = yt_song(vid(1), "Перемен! (piano cover by ustroevv)", "Кино", 292000, kind="video")
+        self.assertEqual(yi.best_of(track("Перемен", "КИНО", "4:52"), [fan])[2], "check")
+        own = yt_song(vid(2), "Wicked Game (Cover)", "In Flames", 238000, "Down, Wicked & No Good")
+        self.assertEqual(yi.best_of(track("Wicked Game", "In Flames", "3:58"), [own])[2], "matched")
+
+    def test_album_track_of_another_length_is_matched_before_any_video(self):
         exported = track("Smells Like Teen Spirit", "Nirvana", "4:36")
         fake = FakeYouTube({
             ("Smells Like Teen Spirit Nirvana", yi.SONGS): [
@@ -240,7 +254,13 @@ class MatchTest(unittest.TestCase):
                 song_item("Smells Like Teen Spirit", "Nirvana", "4:39", vid(2), "MUSIC_VIDEO_TYPE_OMV")],
         })
         song, _, status = yi.find_match(fake, exported)
-        self.assertEqual((song["id"], status), (vid(1), "check"))
+        self.assertEqual((song["id"], status), (vid(1), "matched"))
+
+    def test_album_track_beats_a_video_of_a_closer_length(self):
+        exported = track("Smells Like Teen Spirit", "Nirvana", "4:36")
+        video = yt_song(vid(2), "Smells Like Teen Spirit", "Nirvana", 279000, kind="video")
+        album = yt_song(vid(1), "Smells Like Teen Spirit", "Nirvana", 301000, "Nevermind")
+        self.assertEqual(yi.best_of(exported, [video, album])[0]["id"], vid(1))
 
     def test_video_beats_an_uncertain_song_by_another_artist(self):
         exported = track("Smells Like Teen Spirit", "Nirvana", "4:36")

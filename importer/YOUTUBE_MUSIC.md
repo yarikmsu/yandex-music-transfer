@@ -39,22 +39,23 @@ bash run/ytmusic.sh import --apply   # like the songs (one request per song)
 ## Matching
 
 Each exported track is searched among YouTube Music's songs by title and artist, then
-by title alone, then among videos. The best candidate is compared on title, artist
-(Cyrillic and Latin spellings both count) and length, the same way the Apple importer
-does. When nothing matches for sure, an official track with the same title and artist is
-suggested before a video, even when the video's length is closer. Where your reviewed Apple matches in `out/apple/matches.csv` name another artist or
+by title alone, then among videos. The best candidate is compared on title and artist
+(Cyrillic and Latin spellings both count, and one of several artists is enough). An
+official track is preferred to a video of the same song, even when the video's length is
+closer. Where your reviewed Apple matches in `out/apple/matches.csv` name another artist or
 title, for example the original instead of a karaoke copy, YouTube is searched for that
 Apple song instead, so your review carries over. An Apple match that is itself a karaoke
 or tribute copy ("as made famous by ...") of a track that is not is ignored.
 
 The `status` in `matches.csv` is:
 
-- `matched`: an official album track whose title and artist agree and whose length is
-  within 10 seconds; it will be liked
-- `check`: a likely candidate, but something differs, YouTube has only a video of it
-  (`youtube_type` is `video`: a music video, live recording or fan upload), or the
-  candidate is a karaoke or tribute copy while your track is not. Videos and copies are
-  never liked unless you approve them
+- `matched`: the title and artist agree, whatever the length, so it can be another edit,
+  live or remastered version of the song; it will be liked. Where YouTube has no
+  official track of it, this can be a video (`youtube_type` is `video`: a music video,
+  live recording or fan upload)
+- `check`: a likely candidate, but the title or artist differs, or it is a karaoke or
+  tribute copy or a fan's cover video while your track is not. It is not liked unless
+  you approve it
 - `missing`: nothing close; not liked
 
 To hear a candidate, open `https://music.youtube.com/watch?v=<video_id>`. To like a `check`

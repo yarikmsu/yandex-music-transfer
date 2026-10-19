@@ -71,6 +71,9 @@ YTCFG = re.compile(r"ytcfg\.set\s*\(\s*({.+?})\s*\)\s*;")
 # Karaoke labels often credit the original artist, as "Scott McKenzie (Karaoke)",
 # so the artist score alone does not tell the copy from the original
 KARAOKE = re.compile(r"karaoke|караоке", re.IGNORECASE)
+# On an official track "(Cover)" is the credited artist's own recording; on a video it
+# is usually a fan playing the song
+FAN_COVER = re.compile(r"\bcover\b", re.IGNORECASE)
 
 
 # --- YouTube Music API ---
@@ -222,31 +225,34 @@ def reference(track: dict, apple_row: dict | None) -> dict:
             "album": apple_row["apple_album"], "duration": apple_row["apple_duration"]}
 
 
-def is_copy(title: str, artist: str, album: str) -> bool:
-    """Whether the names mark a karaoke or tribute copy of someone else's song."""
-    return bool(COVER_OF.search(title) or KARAOKE.search(f"{title} {artist} {album}"))
+def is_copy(title: str, artist: str, album: str, video: bool = False) -> bool:
+    """Whether the names mark a karaoke or tribute copy of someone else's song, or a
+    fan's cover video."""
+    return bool(COVER_OF.search(title) or KARAOKE.search(f"{title} {artist} {album}")
+                or (video and FAN_COVER.search(title)))
 
 
 def status_of(scores: dict, song: dict, reference: dict) -> str:
-    # Videos and karaoke or tribute copies are never imported unreviewed, however
-    # well they match, unless the exported track is such a copy itself
-    status = classify(scores)
+    # Title and artist agreeing is enough, whatever the length: that is usually another
+    # edit or version of the same song. Karaoke and tribute copies and fans' cover
+    # videos still need a look, unless the exported track is such a copy itself
+    agree = scores["title"] >= 0.85 and scores["artist"] >= 0.8
+    status = "matched" if agree else classify(scores)
     if status != "matched":
         return status
     attrs = song["attributes"]
-    copy = (is_copy(attrs["name"], attrs["artistName"], attrs["albumName"])
-            and not is_copy(reference["title"], reference["artist"], reference["album"]))
-    return "check" if song["type"] != "song" or copy else status
+    video = song["type"] != "song"
+    copy = (is_copy(attrs["name"], attrs["artistName"], attrs["albumName"], video)
+            and not is_copy(reference["title"], reference["artist"], reference["album"], video))
+    return "check" if copy else status
 
 
 def _rank(best: tuple[dict, dict, str]) -> tuple[int, bool, float]:
     song, scores, status = best
-    # Among uncertain candidates, an official track whose title and artist agree beats
-    # a video whose length is closer: the track is usually the album version of the
-    # song, the video an edit or a fan upload
-    same_song = (status == "check" and song["type"] == "song"
-                 and scores["title"] >= 0.85 and scores["artist"] >= 0.8)
-    return STATUS_RANK[status], same_song, scores["total"]
+    # An official track beats a video of the same song, even one of a closer length:
+    # the video is often an edit or a fan upload
+    official = status == "matched" and song["type"] == "song"
+    return STATUS_RANK[status], official, scores["total"]
 
 
 def best_of(reference: dict, candidates: list[dict]) -> tuple[dict, dict, str] | None:
