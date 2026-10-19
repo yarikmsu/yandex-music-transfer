@@ -231,6 +231,27 @@ class MatchTest(unittest.TestCase):
         self.assertEqual((row["status"], row["youtube_type"], row["video_id"]), ("check", "video", "ugc1"))
         self.assertEqual(len(fake.queries()), 3)
 
+    def test_album_track_of_another_length_beats_a_closer_video(self):
+        exported = track("Smells Like Teen Spirit", "Nirvana", "4:36")
+        fake = FakeYouTube({
+            ("Smells Like Teen Spirit Nirvana", yi.SONGS): [
+                song_item("Smells Like Teen Spirit", "Nirvana", "5:01", vid(1))],
+            ("Smells Like Teen Spirit Nirvana", yi.VIDEOS): [
+                song_item("Smells Like Teen Spirit", "Nirvana", "4:39", vid(2), "MUSIC_VIDEO_TYPE_OMV")],
+        })
+        song, _, status = yi.find_match(fake, exported)
+        self.assertEqual((song["id"], status), (vid(1), "check"))
+
+    def test_video_beats_an_uncertain_song_by_another_artist(self):
+        exported = track("Smells Like Teen Spirit", "Nirvana", "4:36")
+        fake = FakeYouTube({
+            ("Smells Like Teen Spirit Nirvana", yi.SONGS): [
+                song_item("Smells Like Teen Spirit", "Nirvana Tribute Band", "4:36", vid(1))],
+            ("Smells Like Teen Spirit Nirvana", yi.VIDEOS): [
+                song_item("Smells Like Teen Spirit", "Nirvana", "4:39", vid(2), "MUSIC_VIDEO_TYPE_OMV")],
+        })
+        self.assertEqual(yi.find_match(fake, exported)[0]["id"], vid(2))
+
     def test_karaoke_copy_credited_to_the_original_artist_is_only_check(self):
         copy = yt_song(vid(1), "San Francisco", "Scott McKenzie (Karaoke)", 174000,
                        "Zoom Karaoke Golden Years 1967")

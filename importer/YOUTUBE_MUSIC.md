@@ -41,7 +41,8 @@ bash run/ytmusic.sh import --apply   # like the songs (one request per song)
 Each exported track is searched among YouTube Music's songs by title and artist, then
 by title alone, then among videos. The best candidate is compared on title, artist
 (Cyrillic and Latin spellings both count) and length, the same way the Apple importer
-does. Where your reviewed Apple matches in `out/apple/matches.csv` name another artist or
+does. When nothing matches for sure, an official track with the same title and artist is
+suggested before a video, even when the video's length is closer. Where your reviewed Apple matches in `out/apple/matches.csv` name another artist or
 title, for example the original instead of a karaoke copy, YouTube is searched for that
 Apple song instead, so your review carries over. An Apple match that is itself a karaoke
 or tribute copy ("as made famous by ...") of a track that is not is ignored.

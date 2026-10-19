@@ -239,8 +239,14 @@ def status_of(scores: dict, song: dict, reference: dict) -> str:
     return "check" if song["type"] != "song" or copy else status
 
 
-def _rank(best: tuple[dict, dict, str]) -> tuple[int, float]:
-    return STATUS_RANK[best[2]], best[1]["total"]
+def _rank(best: tuple[dict, dict, str]) -> tuple[int, bool, float]:
+    song, scores, status = best
+    # Among uncertain candidates, an official track whose title and artist agree beats
+    # a video whose length is closer: the track is usually the album version of the
+    # song, the video an edit or a fan upload
+    same_song = (status == "check" and song["type"] == "song"
+                 and scores["title"] >= 0.85 and scores["artist"] >= 0.8)
+    return STATUS_RANK[status], same_song, scores["total"]
 
 
 def best_of(reference: dict, candidates: list[dict]) -> tuple[dict, dict, str] | None:
