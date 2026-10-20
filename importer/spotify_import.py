@@ -9,6 +9,7 @@ Run in the export folder:
 Every command but the dry run reads the login from SPOTIFY_SP_DC: the sp_dc cookie of a
 signed-in open.spotify.com session.
 """
+import collections
 import csv
 import hashlib
 import hmac
@@ -24,10 +25,10 @@ from typing import NamedTuple
 
 from amazon_import import best_of, other_recording, rank
 from apple_import import (
-    MAX_ATTEMPTS, ApiError, JsonClient, format_duration, load_tracks, print_status_summary, progress,
-    read_csv,
+    MAX_ATTEMPTS, ApiError, JsonClient, format_duration, load_collections, load_tracks,
+    print_status_summary, progress, read_csv,
 )
-from ytmusic_import import dig, load_apple_matches, reference
+from ytmusic_import import dig, like_order, load_apple_matches, reference
 
 # Spotify's developer API needs a Premium app owner and refuses the player's own token,
 # so this does what the open.spotify.com player does. Its login code and the IDs of its
@@ -60,7 +61,15 @@ MATCH_FIELDS = [
     "yandex_id", "title", "artist", "album", "duration", "status", "spotify_id",
     "spotify_title", "spotify_artist", "spotify_album", "spotify_duration", "score",
 ]
+NOT_IMPORTED_FIELDS = [
+    "status", "title", "artist", "duration", "in",
+    "closest_title", "closest_artist", "closest_duration", "spotify_id", "yandex_id",
+]
+STATUSES = ("matched", "check", "missing", "skip")
 TRACK_URI = "spotify:track:"
+# A track ID alone, its spotify: URI, or a share link (Share > Copy Song Link)
+TRACK_ID = re.compile(r"(?:spotify:track:|https?://open\.spotify\.com/(?:intl-[\w-]+/)?track/)?"
+                      r"([0-9A-Za-z]{22})(?:\?\S*)?")
 # The player's own search page asks for these; more than 10 results are refused
 SEARCH_VARIABLES = {"offset": 0, "limit": 10, "numberOfTopResults": 5, "includeAudiobooks": False,
                     "includePreReleases": False, "includeAuthors": False}
@@ -320,10 +329,51 @@ def match_row(track_id: str, track: dict, best) -> dict:
 
 # --- Local files ---
 
+def track_id_of(value: str) -> str | None:
+    found = TRACK_ID.fullmatch(value.strip())
+    return found.group(1) if found else None
+
+
 def load_matches() -> dict[str, dict]:
     if not os.path.exists(MATCHES_PATH):
         return {}
     return {row["yandex_id"]: row for row in read_csv(MATCHES_PATH)}
+
+
+def write_not_imported(matches: dict, ids: dict, liked: list[str], playlists: list) -> None:
+    """Every track that will not be liked, where it was, and the closest Spotify candidate."""
+    places = collections.defaultdict(list)
+    for track_id in liked:
+        places[track_id].append("liked")
+    for name, track_ids in playlists:
+        for track_id in track_ids:
+            places[track_id].append(name)
+    rows = [{
+        "status": row["status"], "title": row["title"], "artist": row["artist"],
+        "duration": row["duration"], "in": ", ".join(dict.fromkeys(places[track_id])),
+        "closest_title": row["spotify_title"], "closest_artist": row["spotify_artist"],
+        "closest_duration": row["spotify_duration"], "spotify_id": row["spotify_id"], "yandex_id": track_id,
+    } for track_id, row in matches.items() if track_id not in ids]
+    tmp_path = NOT_IMPORTED_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=NOT_IMPORTED_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp_path, NOT_IMPORTED_PATH)
+
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_PATH):
+        return {"liked": []}
+    with open(STATE_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state: dict) -> None:
+    tmp_path = STATE_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp_path, STATE_PATH)
 
 
 # --- Commands ---
@@ -362,3 +412,124 @@ def search_tracks(client: SpotifyClient, tracks: dict, apple: dict, done: dict) 
             f.flush()
             if i % 25 == 0 or i == len(todo):
                 print(progress(i, len(todo), started, "searched"))
+
+
+def account_name(client: SpotifyClient) -> str:
+    name = dig(client.graphql("profileAttributes", {}), "me", "profile", "name")
+    if not name:
+        raise LoginRefused()
+    return name
+
+
+def cmd_check(client: SpotifyClient) -> None:
+    print(f"Cookie works. Signed in to Spotify as {account_name(client)}")
+
+
+def latest_like(client: SpotifyClient) -> str | None:
+    uri = dig(client.graphql("fetchLibraryTracks", {"offset": 0, "limit": 1}),
+              "me", "library", "tracks", "items", 0, "track", "_uri")
+    return track_id_of(uri) if isinstance(uri, str) else None
+
+
+def like_songs(client: SpotifyClient, state: dict, songs: list[str]) -> None:
+    # Liking a song again moves it to the top, so every song is liked once per import
+    done = set(state["liked"])
+    pending = [s for s in songs if s not in done]
+    if state["liked"] and pending:
+        print(f"  {len(pending)} songs are new since the last import; "
+              "they will appear above the songs liked before.")
+    client.pause = max(client.pause, LIKE_PAUSE)
+    started = time.monotonic()
+    for i, song in enumerate(pending, 1):
+        try:
+            answer = client.graphql("addToLibrary", {"libraryItemUris": [TRACK_URI + song], "interactionId": None})
+        except LoginRefused:
+            raise
+        except ApiError as e:
+            raise ApiError(f"liking {OPEN}/track/{song} failed: {e}; stopped so a rerun keeps the order",
+                           e.status) from None
+        if not answer.get("addLibraryItems"):
+            raise ApiError(f"liking {song} returned no result; stopped so a rerun keeps the order")
+        state["liked"].append(song)
+        save_state(state)
+        # The order assumes Liked Songs lists the latest like first; as a like always lands
+        # on top, one look settles it
+        if i == 1 and latest_like(client) != song:
+            raise ApiError("Liked Songs did not show the song just liked on top, so the newest Yandex "
+                           "likes would not end up first. Stopped after 1 like; see 'Order' in "
+                           "importer/SPOTIFY.md.")
+        if i % 50 == 0 or i == len(pending):
+            print(progress(i, len(pending), started, "liked"))
+    print(f"  Liked Songs: {len(state['liked'])} songs liked by this importer")
+
+
+def blockers(tracks: dict, matches: dict) -> list[str]:
+    """What keeps import --apply from liking anything yet, one message per problem."""
+    problems = []
+    unsearched = sum(track_id not in matches for track_id in tracks)
+    if unsearched:
+        problems.append(f"{unsearched} tracks are not searched yet: run 'match' again.")
+    to_check = sum(row["status"] == "check" for row in matches.values())
+    if to_check:
+        problems.append(f"{to_check} rows in {MATCHES_PATH} are still 'check': change each to "
+                        "matched, missing or skip.")
+    # A typo would silently leave an approved song out, and adding it later puts it on top
+    for row in matches.values():
+        where = f"Row {row['yandex_id']} ({row['title']})"
+        if row["status"] not in STATUSES:
+            problems.append(f"{where}: unknown status '{row['status']}'.")
+        elif row["status"] == "matched" and track_id_of(row["spotify_id"]) is None:
+            problems.append(f"{where}: '{row['spotify_id']}' is not a Spotify track ID (the 22 "
+                            "characters after /track/ in its link).")
+    return problems
+
+
+def cmd_import(client: SpotifyClient | None, apply: bool) -> None:
+    matches = load_matches()
+    if not matches:
+        sys.exit("Run 'match' first.")
+    liked, playlists = load_collections()
+    ids = {track_id: track_id_of(row["spotify_id"]) for track_id, row in matches.items()
+           if row["status"] == "matched" and track_id_of(row["spotify_id"])}
+    songs = like_order(liked, playlists, ids)
+    write_not_imported(matches, ids, liked, playlists)
+    print(f"Liked Songs: {len(songs)} songs from {len(liked)} liked tracks "
+          f"and {len(playlists)} playlists")
+    print(f"Not liked: {len(matches) - len(ids)} tracks, listed in {NOT_IMPORTED_PATH}")
+    problems = blockers(load_tracks(), matches)
+    for problem in problems:
+        print(problem)
+    if not apply:
+        print("Nothing changed. Run 'import --apply' to like these songs.")
+        return
+    if problems:
+        # A like cannot be moved down later, so every track needs its decision first
+        sys.exit("Nothing liked: settle the rows above first.")
+    print(f"Signed in as {account_name(client)}")
+    like_songs(client, load_state(), songs)
+    print("Done.")
+
+
+def main(argv: list[str]) -> int:
+    command = argv[1] if len(argv) > 1 else ""
+    if command not in ("check", "match", "import"):
+        print(__doc__)
+        return 2
+    apply = "--apply" in argv[2:]
+    try:
+        # The dry run reads only local files, so it never needs the login
+        client = SpotifyClient(load_login(), load_player()) if command != "import" or apply else None
+        if command == "check":
+            cmd_check(client)
+        elif command == "match":
+            cmd_match(client)
+        else:
+            cmd_import(client, apply)
+    except ApiError as e:
+        print(f"Spotify error: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

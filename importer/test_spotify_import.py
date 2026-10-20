@@ -227,22 +227,39 @@ APPLE_HEADER = ["yandex_id", "title", "artist", "album", "duration", "status",
 
 
 class FakeSpotify:
-    """Answers searches from `answers`, keyed by search term, and records every call."""
+    """Answers searches from `answers`, keyed by search term, keeps Liked Songs newest first
+    (liking a song again moves it to the top, as Spotify does), and records every call."""
 
     pause = sp.SEARCH_PAUSE
 
     def __init__(self, answers=None):
         self.answers = answers or {}
         self.calls = []
+        self.liked_songs = []
 
     def graphql(self, operation, variables):
         self.calls.append((operation, variables))
         if operation == "searchTracks":
             return search_data(*self.answers.get(variables["searchTerm"], []))
+        if operation == "profileAttributes":
+            return {"me": {"profile": {"name": "Test User"}}}
+        if operation == "addToLibrary":
+            for uri in variables["libraryItemUris"]:
+                if uri in self.liked_songs:
+                    self.liked_songs.remove(uri)
+                self.liked_songs.insert(0, uri)
+            return {"addLibraryItems": {"__typename": "AddLibraryItemsResponse"}}
+        if operation == "fetchLibraryTracks":
+            top = self.liked_songs[variables["offset"]:variables["offset"] + variables["limit"]]
+            return {"me": {"library": {"tracks": {"items": [{"track": {"_uri": uri}} for uri in top]}}}}
         return {}
 
     def queries(self):
         return [variables["searchTerm"] for operation, variables in self.calls if operation == "searchTracks"]
+
+    def liked(self):
+        return [uri.removeprefix("spotify:track:") for operation, variables in self.calls
+                if operation == "addToLibrary" for uri in variables["libraryItemUris"]]
 
 
 class InTempDir(unittest.TestCase):
@@ -428,6 +445,189 @@ class MatchCommandTest(InTempDir):
     @mock.patch("builtins.print")
     def test_refused_login_while_searching_keeps_its_advice(self, _print):
         self.assertEqual(self.failing_search(sp.LoginRefused()), sp.LOGIN_REFUSED)
+
+
+def match(track_id, status, spotify_id=""):
+    return {**dict.fromkeys(sp.MATCH_FIELDS, ""), "yandex_id": track_id, "status": status,
+            "spotify_id": spotify_id}
+
+
+class TrackIdTest(unittest.TestCase):
+    def test_id_link_and_uri_give_the_id(self):
+        for value in (tid(7), f"https://open.spotify.com/track/{tid(7)}?si=abc", f"spotify:track:{tid(7)}",
+                      f" https://open.spotify.com/intl-de/track/{tid(7)} "):
+            self.assertEqual(sp.track_id_of(value), tid(7))
+
+    def test_anything_else_is_no_track_id(self):
+        for value in ("B07ABCDEF1", f"https://open.spotify.com/album/{tid(7)}", "", tid(7) + "x"):
+            self.assertIsNone(sp.track_id_of(value))
+
+
+@mock.patch("builtins.print")
+class ImportTest(InTempDir):
+    def setUp(self):
+        super().setUp()
+        write_csv("liked_tracks_me.csv", OK_HEADER, [
+            ["1", "New like", "A", "", "", "3:00", "10", "OK"],
+            ["2", "Old like", "A", "", "", "3:00", "11", "OK"],
+        ])
+        write_csv("playlist_me_Mix.csv", OK_HEADER, [
+            ["1", "Mix song", "B", "", "", "3:00", "12", "OK"],
+            ["2", "New like", "A", "", "", "3:00", "10", "OK"],
+            ["3", "Lost song", "C", "", "", "3:00", "13", "OK"],
+        ])
+        os.makedirs(sp.SPOTIFY_DIR)
+        self.rows = {"10": match("10", "matched", tid(10)), "11": match("11", "matched", tid(11)),
+                     "12": match("12", "matched", tid(12)), "13": match("13", "missing")}
+        write_matches(self.rows)
+        self.fake = FakeSpotify()
+
+    def assert_refused(self):
+        write_matches(self.rows)
+        with self.assertRaises(SystemExit):
+            sp.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_apply_likes_playlist_only_songs_then_liked_oldest_first(self, _print):
+        sp.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.liked(), [tid(12), tid(11), tid(10)])
+        self.assertEqual({operation for operation, _ in self.fake.calls},
+                         {"profileAttributes", "addToLibrary", "fetchLibraryTracks"})
+        self.assertEqual(sp.load_state()["liked"], [tid(12), tid(11), tid(10)])
+
+    def test_likes_go_slower_than_searches(self, _print):
+        sp.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.pause, sp.LIKE_PAUSE)
+
+    def test_pasted_link_in_spotify_id_is_liked_as_its_id(self, _print):
+        self.rows["12"] = match("12", "matched", f"https://open.spotify.com/track/{tid(12)}?si=abc")
+        write_matches(self.rows)
+        sp.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.liked()[0], tid(12))
+
+    def test_malformed_spotify_id_blocks_apply(self, _print):
+        self.rows["12"] = match("12", "matched", "B000000012")
+        self.assert_refused()
+        printed = " ".join(str(c.args[0]) for c in _print.call_args_list if c.args)
+        self.assertIn("Row 12", printed)
+        self.assertIn("not a Spotify track ID", printed)
+
+    def test_apply_refuses_while_rows_need_a_check(self, _print):
+        self.rows["13"] = match("13", "check", tid(13))
+        self.assert_refused()
+
+    def test_apply_refuses_while_tracks_are_unsearched(self, _print):
+        del self.rows["13"]
+        self.assert_refused()
+
+    def test_apply_refuses_an_unknown_status(self, _print):
+        self.rows["12"] = match("12", "Matched", tid(12))
+        self.assert_refused()
+
+    def test_rerun_likes_only_what_is_missing(self, _print):
+        sp.save_state({"liked": [tid(12), tid(11)]})
+        sp.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.liked(), [tid(10)])
+        self.assertEqual(sp.load_state()["liked"], [tid(12), tid(11), tid(10)])
+
+    def test_order_is_checked_once_after_the_first_like(self, _print):
+        sp.like_songs(self.fake, {"liked": []}, [tid(n) for n in range(1, 6)])
+        operations = [operation for operation, _ in self.fake.calls]
+        self.assertEqual(operations.count("fetchLibraryTracks"), 1)
+        self.assertEqual(operations[:2], ["addToLibrary", "fetchLibraryTracks"])
+
+    def test_wrong_song_on_top_stops_after_the_first_like(self, _print):
+        self.fake.graphql = lambda operation, variables: (
+            {"me": {"library": {"tracks": {"items": [{"track": {"_uri": f"spotify:track:{tid(99)}"}}]}}}}
+            if operation == "fetchLibraryTracks" else FakeSpotify.graphql(self.fake, operation, variables))
+        with self.assertRaises(sp.ApiError) as raised:
+            sp.like_songs(self.fake, {"liked": []}, [tid(n) for n in range(1, 6)])
+        self.assertIn("Order", str(raised.exception))
+        self.assertIn("importer/SPOTIFY.md", str(raised.exception))
+        self.assertEqual(self.fake.liked(), [tid(1)])
+        self.assertEqual(sp.load_state()["liked"], [tid(1)])
+
+    def test_song_liked_before_the_import_is_liked_again_in_its_place(self, _print):
+        self.fake.liked_songs = [f"spotify:track:{tid(11)}"]
+        sp.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.liked_songs, [f"spotify:track:{tid(n)}" for n in (10, 11, 12)])
+
+    def test_failed_like_names_the_track_link(self, _print):
+        def graphql(operation, variables):
+            if variables.get("libraryItemUris") == [f"spotify:track:{tid(11)}"]:
+                raise sp.ApiError("boom")
+            return FakeSpotify.graphql(self.fake, operation, variables)
+
+        self.fake.graphql = graphql
+        with self.assertRaises(sp.ApiError) as raised:
+            sp.cmd_import(self.fake, apply=True)
+        self.assertIn(f"https://open.spotify.com/track/{tid(11)}", str(raised.exception))
+        self.assertIn("keeps the order", str(raised.exception))
+        self.assertEqual(sp.load_state()["liked"], [tid(12)])
+
+    def test_refused_login_while_liking_keeps_its_advice(self, _print):
+        def graphql(operation, variables):
+            if operation == "addToLibrary":
+                raise sp.LoginRefused()
+            return FakeSpotify.graphql(self.fake, operation, variables)
+
+        self.fake.graphql = graphql
+        with self.assertRaises(sp.ApiError) as raised:
+            sp.cmd_import(self.fake, apply=True)
+        self.assertEqual(str(raised.exception), sp.LOGIN_REFUSED)
+
+    def test_like_without_a_result_stops_the_run(self, _print):
+        self.fake.graphql = lambda operation, variables: (
+            {} if operation == "addToLibrary" else FakeSpotify.graphql(self.fake, operation, variables))
+        with self.assertRaises(sp.ApiError):
+            sp.cmd_import(self.fake, apply=True)
+        self.assertFalse(os.path.exists(sp.STATE_PATH))
+
+    def test_dry_run_likes_nothing_and_writes_the_report(self, _print):
+        sp.cmd_import(None, apply=False)
+        self.assertFalse(os.path.exists(sp.STATE_PATH))
+        report = read_report()
+        self.assertEqual([(r["yandex_id"], r["status"], r["in"]) for r in report], [("13", "missing", "Mix")])
+
+    def test_dry_run_needs_no_login(self, _print):
+        with mock.patch.dict(os.environ, {"SPOTIFY_SP_DC": ""}), \
+                mock.patch.object(sp, "SpotifyClient") as client, mock.patch.object(sp, "load_player") as player:
+            self.assertEqual(sp.main(["spotify_import.py", "import"]), 0)
+            with self.assertRaises(SystemExit):
+                sp.main(["spotify_import.py", "import", "--apply"])
+        client.assert_not_called()
+        player.assert_not_called()
+
+
+def read_report():
+    with open(sp.NOT_IMPORTED_PATH, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+@mock.patch("builtins.print")
+class CheckTest(unittest.TestCase):
+    def test_check_names_the_account(self, printed):
+        sp.cmd_check(FakeSpotify())
+        printed.assert_called_with("Cookie works. Signed in to Spotify as Test User")
+
+    def test_profile_without_a_name_means_not_signed_in(self, _print):
+        fake = FakeSpotify()
+        fake.graphql = lambda operation, variables: {"me": None}
+        with self.assertRaises(sp.LoginRefused):
+            sp.cmd_check(fake)
+
+
+@mock.patch("builtins.print")
+class MainTest(unittest.TestCase):
+    def test_unknown_command_shows_the_usage(self, printed):
+        self.assertEqual(sp.main(["spotify_import.py"]), 2)
+        printed.assert_called_with(sp.__doc__)
+
+    def test_spotify_errors_are_reported(self, printed):
+        with mock.patch.object(sp, "load_login", return_value="SPDC"), \
+                mock.patch.object(sp, "load_player", side_effect=sp.ApiError("boom")):
+            self.assertEqual(sp.main(["spotify_import.py", "check"]), 1)
+        printed.assert_called_with("Spotify error: boom")
 
 
 if __name__ == "__main__":
