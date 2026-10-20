@@ -10,16 +10,19 @@ Every command but the dry run reads the login from AMAZON_MUSIC_AUTH: the author
 header of a request the signed-in music.amazon.com player sends to gql.music.amazon.dev.
 """
 import base64
+import collections
 import csv
 import json
 import os
+import re
 import sys
 import time
 
 from apple_import import (
-    ApiError, JsonClient, format_duration, load_tracks, print_status_summary, progress, read_csv,
+    ApiError, JsonClient, format_duration, load_collections, load_tracks, print_status_summary,
+    progress, read_csv,
 )
-from ytmusic_import import best_of, dig, load_apple_matches, reference
+from ytmusic_import import best_of, dig, like_order, load_apple_matches, reference
 
 # Amazon's documented Music API is a closed beta; these are the calls its own web
 # player makes, as used by SongMirror (github.com/ahnafnafee/songmirror)
@@ -41,16 +44,30 @@ LIKE_PAUSE = 2.0
 
 AMAZON_DIR = "amazon"
 MATCHES_PATH = os.path.join(AMAZON_DIR, "matches.csv")
+STATE_PATH = os.path.join(AMAZON_DIR, "state.json")
+NOT_IMPORTED_PATH = os.path.join(AMAZON_DIR, "not_imported.csv")
 MATCH_FIELDS = [
     "yandex_id", "title", "artist", "album", "duration", "status", "asin",
     "amazon_title", "amazon_artist", "amazon_album", "amazon_duration", "score",
 ]
+NOT_IMPORTED_FIELDS = [
+    "status", "title", "artist", "duration", "in",
+    "closest_title", "closest_artist", "closest_duration", "asin", "yandex_id",
+]
+STATUSES = ("matched", "check", "missing", "skip")
+ASIN = re.compile(r"[A-Z0-9]{10}")
 
 SEARCH_QUERY = """
 query SearchTracks($query: String!) {
   searchTracks(searchOptions: {searchFilters: [{field: "name", query: $query}]}) {
     edges { node { id title duration album { title } contributingArtists { edges { node { name } } } } }
   }
+}"""
+USER_QUERY = "query User { user { id } }"
+# The only write this importer makes. Never NEUTRAL or DISLIKE: nothing is ever unliked
+LIKE_MUTATION = """
+mutation Like($trackId: String!, $likeState: String!) {
+  setTrackLikeState(trackId: $trackId, likeState: $likeState) { __typename }
 }"""
 
 
@@ -176,6 +193,42 @@ def write_matches(rows: dict[str, dict]) -> None:
     os.replace(tmp_path, MATCHES_PATH)
 
 
+def write_not_imported(matches: dict, asins: dict, liked: list[str], playlists: list) -> None:
+    """Every track that will not be liked, where it was, and the closest Amazon candidate."""
+    places = collections.defaultdict(list)
+    for track_id in liked:
+        places[track_id].append("liked")
+    for name, track_ids in playlists:
+        for track_id in track_ids:
+            places[track_id].append(name)
+    rows = [{
+        "status": row["status"], "title": row["title"], "artist": row["artist"],
+        "duration": row["duration"], "in": ", ".join(dict.fromkeys(places[track_id])),
+        "closest_title": row["amazon_title"], "closest_artist": row["amazon_artist"],
+        "closest_duration": row["amazon_duration"], "asin": row["asin"], "yandex_id": track_id,
+    } for track_id, row in matches.items() if track_id not in asins]
+    tmp_path = NOT_IMPORTED_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=NOT_IMPORTED_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp_path, NOT_IMPORTED_PATH)
+
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_PATH):
+        return {"liked": []}
+    with open(STATE_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state: dict) -> None:
+    tmp_path = STATE_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp_path, STATE_PATH)
+
+
 # --- Commands ---
 
 def cmd_match(client: AmazonMusicClient) -> None:
@@ -206,6 +259,84 @@ def search_tracks(client: AmazonMusicClient, tracks: dict, apple: dict, done: di
                 print(progress(i, len(todo), started, "searched"))
 
 
+def account_id(client: AmazonMusicClient) -> str:
+    user_id = dig(client.graphql(USER_QUERY, {}), "user", "id")
+    if not user_id:
+        raise ApiError("the login is not signed in; copy it again from a signed-in "
+                       "music.amazon.com tab")
+    return user_id
+
+
+def cmd_check(client: AmazonMusicClient) -> None:
+    print(f"Login works. Signed in to Amazon Music as account {account_id(client)}")
+
+
+def like_songs(client: AmazonMusicClient, state: dict, songs: list[str]) -> None:
+    done = set(state["liked"])
+    pending = [s for s in songs if s not in done]
+    if state["liked"] and pending:
+        print(f"  {len(pending)} songs are new since the last import; "
+              "they will appear above the songs liked before.")
+    client.pause = max(client.pause, LIKE_PAUSE)
+    started = time.monotonic()
+    for i, track_asin in enumerate(pending, 1):
+        answer = client.graphql(LIKE_MUTATION, {"trackId": track_asin, "likeState": "LIKE"})
+        if not answer.get("setTrackLikeState"):
+            raise ApiError(f"liking {track_asin} returned no result; stopped so a rerun keeps the order")
+        state["liked"].append(track_asin)
+        save_state(state)
+        if i % 50 == 0 or i == len(pending):
+            print(progress(i, len(pending), started, "liked"))
+    print(f"  Liked Songs: {len(state['liked'])} songs liked by this importer")
+
+
+def blockers(tracks: dict, matches: dict) -> list[str]:
+    """What keeps import --apply from liking anything yet, one message per problem."""
+    problems = []
+    unsearched = sum(track_id not in matches for track_id in tracks)
+    if unsearched:
+        problems.append(f"{unsearched} tracks are not searched yet: run 'match' again.")
+    to_check = sum(row["status"] == "check" for row in matches.values())
+    if to_check:
+        problems.append(f"{to_check} rows in {MATCHES_PATH} are still 'check': change each to "
+                        "matched, missing or skip.")
+    # A typo would silently leave an approved song out, and adding it later puts it on top
+    for row in matches.values():
+        where = f"Row {row['yandex_id']} ({row['title']})"
+        if row["status"] not in STATUSES:
+            problems.append(f"{where}: unknown status '{row['status']}'.")
+        elif row["status"] == "matched" and not ASIN.fullmatch(row["asin"]):
+            problems.append(f"{where}: '{row['asin']}' is not an Amazon track ID (the 10 "
+                            "characters after /tracks/ or trackAsin= in its link).")
+    return problems
+
+
+def cmd_import(client: AmazonMusicClient | None, apply: bool) -> None:
+    matches = load_matches()
+    if not matches:
+        sys.exit("Run 'match' first.")
+    liked, playlists = load_collections()
+    asins = {track_id: row["asin"] for track_id, row in matches.items()
+             if row["status"] == "matched" and ASIN.fullmatch(row["asin"])}
+    songs = like_order(liked, playlists, asins)
+    write_not_imported(matches, asins, liked, playlists)
+    print(f"Liked Songs: {len(songs)} songs from {len(liked)} liked tracks "
+          f"and {len(playlists)} playlists")
+    print(f"Not liked: {len(matches) - len(asins)} tracks, listed in {NOT_IMPORTED_PATH}")
+    problems = blockers(load_tracks(), matches)
+    for problem in problems:
+        print(problem)
+    if not apply:
+        print("Nothing changed. Run 'import --apply' to like these songs.")
+        return
+    if problems:
+        # Likes cannot be reordered later, so every track needs its decision first
+        sys.exit("Nothing liked: settle the rows above first.")
+    print(f"Signed in as account {account_id(client)}")
+    like_songs(client, load_state(), songs)
+    print("Done.")
+
+
 # --- Login ---
 
 def load_login() -> str:
@@ -224,3 +355,28 @@ def load_login() -> str:
                  "request (it starts with 'AmznMusic '). Copy it again from a signed-in "
                  "music.amazon.com tab.")
     return auth
+
+
+def main(argv: list[str]) -> int:
+    command = argv[1] if len(argv) > 1 else ""
+    if command not in ("check", "match", "import"):
+        print(__doc__)
+        return 2
+    apply = "--apply" in argv[2:]
+    try:
+        # The dry run reads only local files, so it never needs the login
+        client = AmazonMusicClient(load_login()) if command != "import" or apply else None
+        if command == "check":
+            cmd_check(client)
+        elif command == "match":
+            cmd_match(client)
+        else:
+            cmd_import(client, apply)
+    except ApiError as e:
+        print(f"Amazon Music error: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

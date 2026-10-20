@@ -62,14 +62,33 @@ class FakeAmazon:
         self.answers = answers or {}
         self.calls = []
 
+    pause = am.SEARCH_PAUSE
+
     def graphql(self, query, variables):
         self.calls.append((query, variables))
         if query == am.SEARCH_QUERY:
             return search_data(*self.answers.get(variables["query"], []))
+        if query == am.USER_QUERY:
+            return {"user": {"id": "amzn1.account.TEST"}}
+        if query == am.LIKE_MUTATION:
+            return {"setTrackLikeState": {"__typename": "SetTrackLikeStateResponse"}}
         return {}
 
     def queries(self):
         return [variables["query"] for query, variables in self.calls if query == am.SEARCH_QUERY]
+
+    def liked(self):
+        return [variables["trackId"] for query, variables in self.calls if query == am.LIKE_MUTATION]
+
+
+def asin(n):
+    """A track ID in Amazon's 10-character ASIN format."""
+    return f"B{n:09d}"
+
+
+def match(track_id, status, track_asin=""):
+    return {**dict.fromkeys(am.MATCH_FIELDS, ""), "yandex_id": track_id, "status": status,
+            "asin": track_asin}
 
 
 class InTempDir(unittest.TestCase):
@@ -199,6 +218,106 @@ class MatchCommandTest(InTempDir):
         self.assertEqual(list(rows), ["10", "11"])
         self.assertEqual((rows["10"]["status"], rows["11"]["asin"]), ("skip", "B11"))
         self.assertEqual(rows["11"]["title"], "Shoot To Thrill (Made Famous By AC/DC)")
+
+
+@mock.patch("builtins.print")
+class ImportTest(InTempDir):
+    def setUp(self):
+        super().setUp()
+        write_csv("liked_tracks_me.csv", OK_HEADER, [
+            ["1", "New like", "A", "", "", "3:00", "10", "OK"],
+            ["2", "Old like", "A", "", "", "3:00", "11", "OK"],
+        ])
+        write_csv("playlist_me_Mix.csv", OK_HEADER, [
+            ["1", "Mix song", "B", "", "", "3:00", "12", "OK"],
+            ["2", "New like", "A", "", "", "3:00", "10", "OK"],
+            ["3", "Lost song", "C", "", "", "3:00", "13", "OK"],
+        ])
+        os.makedirs(am.AMAZON_DIR)
+        self.rows = {"10": match("10", "matched", asin(10)), "11": match("11", "matched", asin(11)),
+                     "12": match("12", "matched", asin(12)), "13": match("13", "missing")}
+        am.write_matches(self.rows)
+        self.fake = FakeAmazon()
+
+    def assert_refused(self):
+        am.write_matches(self.rows)
+        with self.assertRaises(SystemExit):
+            am.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_apply_likes_newest_last_and_only_ever_sets_like(self, _print):
+        am.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.liked(), [asin(12), asin(11), asin(10)])
+        self.assertEqual({query for query, _ in self.fake.calls}, {am.USER_QUERY, am.LIKE_MUTATION})
+        self.assertEqual({v["likeState"] for q, v in self.fake.calls if q == am.LIKE_MUTATION}, {"LIKE"})
+        self.assertEqual(am.load_state()["liked"], [asin(12), asin(11), asin(10)])
+
+    def test_likes_go_slower_than_searches(self, _print):
+        am.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.pause, am.LIKE_PAUSE)
+
+    def test_apply_refuses_while_rows_need_a_check(self, _print):
+        self.rows["13"] = match("13", "check", asin(13))
+        self.assert_refused()
+
+    def test_apply_refuses_while_tracks_are_unsearched(self, _print):
+        del self.rows["13"]
+        self.assert_refused()
+
+    def test_apply_refuses_an_unknown_status(self, _print):
+        self.rows["12"] = match("12", "Matched", asin(12))
+        self.assert_refused()
+
+    def test_apply_refuses_a_matched_row_without_a_valid_track_id(self, _print):
+        self.rows["12"] = match("12", "matched", "https://music.amazon.com/tracks/B000000012")
+        self.assert_refused()
+
+    def test_rerun_continues_after_the_last_like(self, _print):
+        am.save_state({"liked": [asin(12)]})
+        am.cmd_import(self.fake, apply=True)
+        self.assertEqual(self.fake.liked(), [asin(11), asin(10)])
+        self.assertEqual(am.load_state()["liked"], [asin(12), asin(11), asin(10)])
+
+    def test_failed_like_stops_the_run_and_keeps_progress(self, _print):
+        def graphql(query, variables):
+            if variables.get("trackId") == asin(11):
+                raise am.ApiError("HTTP 400")
+            return FakeAmazon.graphql(self.fake, query, variables)
+
+        self.fake.graphql = graphql
+        with self.assertRaises(am.ApiError):
+            am.cmd_import(self.fake, apply=True)
+        self.assertEqual(am.load_state()["liked"], [asin(12)])
+
+    def test_like_without_a_result_stops_the_run(self, _print):
+        self.fake.graphql = lambda query, variables: (
+            {} if query == am.LIKE_MUTATION else FakeAmazon.graphql(self.fake, query, variables))
+        with self.assertRaises(am.ApiError):
+            am.cmd_import(self.fake, apply=True)
+        self.assertFalse(os.path.exists(am.STATE_PATH))
+
+    def test_dry_run_needs_no_login(self, _print):
+        with mock.patch.dict(os.environ, {"AMAZON_MUSIC_AUTH": ""}):
+            self.assertEqual(am.main(["amazon_import.py", "import"]), 0)
+            with self.assertRaises(SystemExit):
+                am.main(["amazon_import.py", "import", "--apply"])
+
+    def test_dry_run_likes_nothing_and_writes_the_report(self, _print):
+        am.cmd_import(None, apply=False)
+        self.assertFalse(os.path.exists(am.STATE_PATH))
+        report = am.read_csv(am.NOT_IMPORTED_PATH)
+        self.assertEqual([(r["yandex_id"], r["status"], r["in"]) for r in report], [("13", "missing", "Mix")])
+
+
+class CheckTest(unittest.TestCase):
+    def test_account_id_is_read_from_the_user(self):
+        self.assertEqual(am.account_id(FakeAmazon()), "amzn1.account.TEST")
+
+    def test_answer_without_a_user_raises(self):
+        client = mock.Mock()
+        client.graphql.return_value = {"user": None}
+        with self.assertRaises(am.ApiError):
+            am.account_id(client)
 
 
 class LoginTest(unittest.TestCase):
