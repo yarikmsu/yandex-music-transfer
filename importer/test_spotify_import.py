@@ -1,6 +1,8 @@
+import csv
 import io
 import json
 import os
+import tempfile
 import unittest
 import urllib.error
 import urllib.parse
@@ -178,6 +180,254 @@ class LoginTest(unittest.TestCase):
                 self.login(value)
             self.assertIn("SPOTIFY_SP_DC", str(raised.exception.code))
             self.assertNotIn("xyz", str(raised.exception.code))
+
+
+def tid(n):
+    """A track ID in Spotify's 22-character format."""
+    return f"{n:022d}"
+
+
+def track_data(track_id, name, artists, millis, album=""):
+    """A searchTracks result in the shape the player's GraphQL returns it."""
+    return {"__typename": "Track", "uri": f"spotify:track:{track_id}", "name": name,
+            "artists": {"items": [{"profile": {"name": artist}} for artist in artists]},
+            "albumOfTrack": {"name": album}, "duration": {"totalMilliseconds": millis}}
+
+
+def search_data(*tracks):
+    return {"searchV2": {"tracksV2": {"items": [{"item": {"data": t}} for t in tracks]}}}
+
+
+def spotify_song(track_id, name, artist, millis, album=""):
+    attributes = {"name": name, "artistName": artist, "albumName": album, "durationInMillis": millis}
+    return {"id": track_id, "type": "song", "attributes": attributes}
+
+
+def track(title, artist, duration="3:31", album=""):
+    return {"title": title, "artist": artist, "album": album, "duration": duration}
+
+
+def write_csv(path, header, rows):
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def write_matches(rows):
+    with open(sp.MATCHES_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=sp.MATCH_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows.values())
+
+
+OK_HEADER = ["#", "Title", "Artist", "Album", "Year", "Duration", "ID", "Availability"]
+APPLE_HEADER = ["yandex_id", "title", "artist", "album", "duration", "status",
+                "apple_id", "apple_title", "apple_artist", "apple_album", "apple_duration", "score"]
+
+
+class FakeSpotify:
+    """Answers searches from `answers`, keyed by search term, and records every call."""
+
+    pause = sp.SEARCH_PAUSE
+
+    def __init__(self, answers=None):
+        self.answers = answers or {}
+        self.calls = []
+
+    def graphql(self, operation, variables):
+        self.calls.append((operation, variables))
+        if operation == "searchTracks":
+            return search_data(*self.answers.get(variables["searchTerm"], []))
+        return {}
+
+    def queries(self):
+        return [variables["searchTerm"] for operation, variables in self.calls if operation == "searchTracks"]
+
+
+class InTempDir(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(tmp.name)
+
+
+class SearchParsingTest(unittest.TestCase):
+    def test_track_becomes_a_catalog_song(self):
+        found = sp.parse_search(search_data(track_data(tid(1), "Линия жизни", ["Сплин"], 183000, "25 кадр")))
+        self.assertEqual(found, [spotify_song(tid(1), "Линия жизни", "Сплин", 183000, "25 кадр")])
+
+    def test_several_artists_are_listed_together_once_each(self):
+        found = sp.parse_search(search_data(track_data(tid(1), "Numb / Encore", ["Linkin Park", "JAY-Z", "JAY-Z"], 1)))
+        self.assertEqual(found[0]["attributes"]["artistName"], "Linkin Park, JAY-Z")
+
+    def test_other_result_types_and_broken_entries_are_dropped(self):
+        no_uri = {**track_data(tid(1), "Song", ["Band"], 1), "uri": None}
+        data = {"searchV2": {"tracksV2": {"items": [
+            {"item": {"data": {"__typename": "NotFound"}}}, {"item": {"data": no_uri}}, {"item": None}, None]}}}
+        self.assertEqual(sp.parse_search(data), [])
+        self.assertEqual(sp.parse_search({}), [])
+        self.assertEqual(sp.parse_search({"searchV2": None}), [])
+
+    def test_unknown_duration_and_missing_names_stay_unknown(self):
+        bare = {"__typename": "Track", "uri": f"spotify:track:{tid(1)}", "name": "Song", "duration": None}
+        self.assertEqual(sp.parse_search(search_data(bare)), [spotify_song(tid(1), "Song", "", None)])
+
+
+@mock.patch.object(sp.time, "sleep")
+class ClientTest(unittest.TestCase):
+    def client(self, tokens):
+        fetch = mock.patch.object(sp, "fetch_token", side_effect=tokens)
+        self.fetch_token = fetch.start()
+        self.addCleanup(fetch.stop)
+        return sp.SpotifyClient("SPDC", PLAYER)
+
+    @mock.patch.object(sp.time, "time", return_value=NOW)
+    def test_search_is_a_persisted_query_with_the_token(self, _time, sleep):
+        client = self.client([("TOKEN", NOW + 3000)])
+        reply = http_ok({"data": search_data(track_data(tid(1), "Линия жизни", ["Сплин"], 183000))})
+        with mock.patch("urllib.request.urlopen", return_value=reply) as urlopen:
+            found = sp.search(client, "Линия жизни Сплин")
+        self.assertEqual([song["id"] for song in found], [tid(1)])
+        sent = urlopen.call_args.args[0]
+        self.assertEqual(sent.full_url, "https://api-partner.spotify.com/pathfinder/v2/query")
+        self.assertEqual(sent.get_method(), "POST")
+        self.assertEqual(sent.get_header("Authorization"), "Bearer TOKEN")
+        self.assertEqual(sent.get_header("App-platform"), "WebPlayer")
+        self.assertIsNone(sent.get_header("Cookie"))
+        body = json.loads(sent.data)
+        self.assertEqual(body["operationName"], "searchTracks")
+        self.assertEqual(body["extensions"], {"persistedQuery": {"version": 1, "sha256Hash": HASHES["searchTracks"]}})
+        self.assertEqual(body["variables"], {
+            "searchTerm": "Линия жизни Сплин", "offset": 0, "limit": 10, "numberOfTopResults": 5,
+            "includeAudiobooks": False, "includePreReleases": False, "includeAuthors": False})
+        self.assertEqual(sleep.call_args.args[0], sp.SEARCH_PAUSE)
+
+    def test_token_is_renewed_before_it_expires(self, _sleep):
+        client = self.client([("TOKEN", NOW + 3000), ("TOKEN2", NOW + 6000)])
+        with mock.patch.object(sp.time, "time", side_effect=[NOW, NOW + 3000 - 299]):
+            with mock.patch("urllib.request.urlopen", return_value=http_ok({"data": {}})) as urlopen:
+                client.graphql("searchTracks", {})
+                client.graphql("searchTracks", {})
+        self.assertEqual(self.fetch_token.call_count, 2)
+        self.assertEqual([c.args[0].get_header("Authorization") for c in urlopen.call_args_list],
+                         ["Bearer TOKEN", "Bearer TOKEN2"])
+
+    @mock.patch.object(sp.time, "time", return_value=NOW)
+    def test_refused_request_renews_the_token_once(self, _time, _sleep):
+        client = self.client([("TOKEN", NOW + 3000), ("TOKEN2", NOW + 6000)])
+        with mock.patch("urllib.request.urlopen", side_effect=[refused(401), http_ok({"data": {"x": 1}})]):
+            self.assertEqual(client.graphql("searchTracks", {}), {"x": 1})
+        self.assertEqual(self.fetch_token.call_count, 2)
+
+    @mock.patch.object(sp.time, "time", return_value=NOW)
+    def test_second_refusal_says_to_copy_the_cookie(self, _time, _sleep):
+        client = self.client([("TOKEN", NOW + 3000), ("TOKEN2", NOW + 6000)])
+        with mock.patch("urllib.request.urlopen", side_effect=[refused(401), refused(401)]):
+            with self.assertRaises(sp.LoginRefused):
+                client.graphql("searchTracks", {})
+
+    @mock.patch.object(sp.time, "time", return_value=NOW)
+    def test_unknown_hash_says_the_player_changed(self, _time, _sleep):
+        client = self.client([("TOKEN", NOW + 3000)])
+        reply = http_ok({"errors": [{"message": "PersistedQueryNotFound"}]})
+        with mock.patch("urllib.request.urlopen", return_value=reply):
+            with self.assertRaises(sp.ApiError) as raised:
+                client.graphql("searchTracks", {})
+        self.assertNotIsInstance(raised.exception, sp.LoginRefused)
+        self.assertIn(sp.PLAYER_CHANGED, str(raised.exception))
+
+    @mock.patch.object(sp.time, "time", return_value=NOW)
+    def test_other_graphql_errors_are_spotify_errors(self, _time, _sleep):
+        client = self.client([("TOKEN", NOW + 3000)])
+        with mock.patch("urllib.request.urlopen", return_value=http_ok({"errors": [{"message": "boom"}]})):
+            with self.assertRaises(sp.ApiError) as raised:
+                client.graphql("searchTracks", {})
+        self.assertIn("boom", str(raised.exception))
+
+
+class MatchTest(unittest.TestCase):
+    def test_first_search_names_the_artist_and_a_match_stops(self):
+        fake = FakeSpotify({"Линия жизни Сплин": [track_data(tid(1), "Линия жизни", ["Сплин"], 183000)]})
+        song, _, status = sp.find_match(fake, track("Линия жизни", "Сплин", "3:02"))
+        self.assertEqual((song["id"], status), (tid(1), "matched"))
+        self.assertEqual(fake.queries(), ["Линия жизни Сплин"])
+
+    def test_title_alone_is_searched_when_the_artist_finds_nothing(self):
+        fake = FakeSpotify({"Линия жизни": [track_data(tid(2), "Линия жизни", ["Splean"], 183000)]})
+        song, _, status = sp.find_match(fake, track("Линия жизни", "Сплин", "3:03"))
+        self.assertEqual((song["id"], status), (tid(2), "matched"))
+        self.assertEqual(fake.queries(), ["Линия жизни Сплин", "Линия жизни"])
+
+    def test_first_of_several_artists_names_the_search(self):
+        fake = FakeSpotify()
+        sp.find_match(fake, track("Numb / Encore", "Linkin Park, JAY-Z"))
+        self.assertEqual(fake.queries()[0], "Numb / Encore Linkin Park")
+
+    def test_live_first_hit_does_not_end_the_search(self):
+        fake = FakeSpotify({"Song Band": [track_data(tid(1), "Song (Live)", ["Band"], 211000)],
+                            "Song": [track_data(tid(2), "Song", ["Band"], 216000)]})
+        song, _, status = sp.find_match(fake, track("Song", "Band", "3:31"))
+        self.assertEqual((song["id"], status), (tid(2), "matched"))
+        self.assertEqual(fake.queries(), ["Song Band", "Song"])
+
+    def test_tie_keeps_the_first_search_song(self):
+        fake = FakeSpotify({"Song Band": [track_data(tid(1), "Song (Live)", ["Band"], 211000)],
+                            "Song": [track_data(tid(2), "Song (Live)", ["Band"], 211000)]})
+        song, _, _ = sp.find_match(fake, track("Song", "Band", "3:31"))
+        self.assertEqual(song["id"], tid(1))
+
+
+class MatchCommandTest(InTempDir):
+    @mock.patch("builtins.print")
+    def test_match_resumes_and_searches_the_reviewed_apple_names(self, _print):
+        write_csv("liked_tracks_me.csv", OK_HEADER, [
+            ["1", "Done", "A", "", "", "3:00", "10", "OK"],
+            ["2", "Shoot To Thrill (Made Famous By AC/DC)", "Iron Man", "", "", "5:20", "11", "OK"],
+        ])
+        os.makedirs("apple")
+        write_csv("apple/matches.csv", APPLE_HEADER, [
+            ["11", "", "", "", "", "matched", "1", "Shoot to Thrill", "AC/DC", "Back in Black", "5:17", "1"]])
+        os.makedirs(sp.SPOTIFY_DIR)
+        write_matches({"10": {**dict.fromkeys(sp.MATCH_FIELDS, ""), "yandex_id": "10", "status": "skip"}})
+        fake = FakeSpotify({"Shoot to Thrill AC/DC": [
+            track_data(tid(11), "Shoot to Thrill", ["AC/DC"], 317000, "Back in Black")]})
+        sp.cmd_match(fake)
+        self.assertEqual(fake.queries(), ["Shoot to Thrill AC/DC"])
+        rows = sp.load_matches()
+        self.assertEqual(list(rows), ["10", "11"])
+        self.assertEqual(rows["10"]["status"], "skip")
+        self.assertEqual({key: rows["11"][key] for key in ("title", "status", "spotify_id", "spotify_title",
+                                                         "spotify_artist", "spotify_album", "spotify_duration")},
+                         {"title": "Shoot To Thrill (Made Famous By AC/DC)", "status": "matched",
+                          "spotify_id": tid(11), "spotify_title": "Shoot to Thrill", "spotify_artist": "AC/DC",
+                          "spotify_album": "Back in Black", "spotify_duration": "5:17"})
+        with open(sp.MATCHES_PATH, encoding="utf-8-sig") as f:
+            self.assertEqual(f.readline().strip(), ",".join(sp.MATCH_FIELDS))
+
+    def failing_search(self, error):
+        write_csv("liked_tracks_me.csv", OK_HEADER, [["1", "Linia", "Splean", "", "", "3:00", "10", "OK"]])
+        fake = FakeSpotify()
+
+        def graphql(operation, variables):
+            raise error
+
+        fake.graphql = graphql
+        with self.assertRaises(sp.ApiError) as raised:
+            sp.cmd_match(fake)
+        return str(raised.exception)
+
+    @mock.patch("builtins.print")
+    def test_failed_search_names_the_track(self, _print):
+        message = self.failing_search(sp.ApiError("Bad field"))
+        self.assertIn("Linia", message)
+        self.assertIn("Bad field", message)
+        self.assertIn("'10,,,,,missing'", message)
+
+    @mock.patch("builtins.print")
+    def test_refused_login_while_searching_keeps_its_advice(self, _print):
+        self.assertEqual(self.failing_search(sp.LoginRefused()), sp.LOGIN_REFUSED)
 
 
 if __name__ == "__main__":

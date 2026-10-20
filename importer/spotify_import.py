@@ -9,6 +9,7 @@ Run in the export folder:
 Every command but the dry run reads the login from SPOTIFY_SP_DC: the sp_dc cookie of a
 signed-in open.spotify.com session.
 """
+import csv
 import hashlib
 import hmac
 import json
@@ -21,7 +22,12 @@ import urllib.error
 import urllib.request
 from typing import NamedTuple
 
-from apple_import import MAX_ATTEMPTS, ApiError, JsonClient
+from amazon_import import best_of, other_recording, rank
+from apple_import import (
+    MAX_ATTEMPTS, ApiError, JsonClient, format_duration, load_tracks, print_status_summary, progress,
+    read_csv,
+)
+from ytmusic_import import dig, load_apple_matches, reference
 
 # Spotify's developer API needs a Premium app owner and refuses the player's own token,
 # so this does what the open.spotify.com player does. Its login code and the IDs of its
@@ -45,6 +51,19 @@ SEARCH_PAUSE = 1.0
 LIKE_PAUSE = 2.0
 # The token lasts about 50 minutes; a new one is fetched this long before it runs out
 TOKEN_MARGIN = 300
+
+SPOTIFY_DIR = "spotify"
+MATCHES_PATH = os.path.join(SPOTIFY_DIR, "matches.csv")
+STATE_PATH = os.path.join(SPOTIFY_DIR, "state.json")
+NOT_IMPORTED_PATH = os.path.join(SPOTIFY_DIR, "not_imported.csv")
+MATCH_FIELDS = [
+    "yandex_id", "title", "artist", "album", "duration", "status", "spotify_id",
+    "spotify_title", "spotify_artist", "spotify_album", "spotify_duration", "score",
+]
+TRACK_URI = "spotify:track:"
+# The player's own search page asks for these; more than 10 results are refused
+SEARCH_VARIABLES = {"offset": 0, "limit": 10, "numberOfTopResults": 5, "includeAudiobooks": False,
+                    "includePreReleases": False, "includeAuthors": False}
 
 STRING_SECRET = re.compile(r"""\{secret:(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"),version:(\d+)\}""")
 NUMBER_SECRET = re.compile(r"\{secret:\[([\d,\s]*)\],version:(\d+)\}")
@@ -175,6 +194,75 @@ def fetch_token(sp_dc: str, player: Player) -> tuple[str, float]:
     return answer["accessToken"], answer["accessTokenExpirationTimestampMs"] / 1000
 
 
+class SpotifyClient(JsonClient):
+    """The player's GraphQL, signed in; the token is renewed from the cookie as it runs out."""
+
+    service = "Spotify"
+
+    def __init__(self, sp_dc: str, player: Player):
+        self.sp_dc = sp_dc
+        self.player = player
+        super().__init__(PATHFINDER, {}, SEARCH_PAUSE)
+        self._renew()
+
+    def _renew(self) -> None:
+        token, self.expires = fetch_token(self.sp_dc, self.player)
+        self.headers = {"Authorization": f"Bearer {token}", "App-Platform": "WebPlayer",
+                        "Content-Type": "application/json", "Accept": "application/json",
+                        "User-Agent": USER_AGENT}
+
+    def graphql(self, operation: str, variables: dict) -> dict:
+        if time.time() > self.expires - TOKEN_MARGIN:
+            self._renew()
+        body = {"operationName": operation, "variables": variables,
+                "extensions": {"persistedQuery": {"version": 1, "sha256Hash": self.player.hashes[operation]}}}
+        try:
+            answer = self.request("POST", QUERY_PATH, body=body)
+        except ApiError as e:
+            if e.status not in (401, 403):
+                raise
+            # A token can be revoked early; the player then fetches a new one the same way
+            self._renew()
+            try:
+                answer = self.request("POST", QUERY_PATH, body=body)
+            except ApiError as e:
+                if e.status in (401, 403):
+                    raise LoginRefused() from None
+                raise
+        errors = answer.get("errors") or []
+        if "PersistedQueryNotFound" in json.dumps(errors):
+            raise ApiError(f"{operation}: {PLAYER_CHANGED}")
+        if errors:
+            messages = (str(error.get("message", error)) if isinstance(error, dict) else str(error)
+                        for error in errors)
+            raise ApiError(f"{operation}: {'; '.join(messages)}")
+        return answer.get("data") or {}
+
+
+def as_song(data) -> dict | None:
+    """A search result in the catalog-song shape apple_import's matching reads."""
+    uri = dig(data, "uri")
+    if dig(data, "__typename") != "Track" or not isinstance(uri, str) or not uri.startswith(TRACK_URI):
+        return None
+    names = [dig(artist, "profile", "name") for artist in dig(data, "artists", "items") or []]
+    attributes = {
+        "name": data.get("name") or "",
+        "artistName": ", ".join(dict.fromkeys(name for name in names if name)),
+        "albumName": dig(data, "albumOfTrack", "name") or "",
+        "durationInMillis": dig(data, "duration", "totalMilliseconds"),
+    }
+    return {"id": uri[len(TRACK_URI):], "type": "song", "attributes": attributes}
+
+
+def parse_search(data: dict) -> list[dict]:
+    items = dig(data, "searchV2", "tracksV2", "items") or []
+    return [song for song in (as_song(dig(item, "item", "data")) for item in items) if song]
+
+
+def search(client: SpotifyClient, query: str) -> list[dict]:
+    return parse_search(client.graphql("searchTracks", {"searchTerm": query, **SEARCH_VARIABLES}))
+
+
 # --- Login ---
 
 def load_login() -> str:
@@ -192,3 +280,85 @@ def load_login() -> str:
         sys.exit("SPOTIFY_SP_DC contains a space, a line break or another unusual character. "
                  "Copy it again, as one line.")
     return value
+
+
+# --- Matching (Amazon's rules: amazon_import.best_of) ---
+
+def find_match(client: SpotifyClient, reference: dict) -> tuple[dict, dict, str] | None:
+    """Songs by title and first artist, then by title alone, which finds artists Spotify
+    spells otherwise; stops at a match of the same recording."""
+    first_artist = reference["artist"].split(", ")[0]
+    best = None
+    for query in ([f"{reference['title']} {first_artist}"] if first_artist else []) + [reference["title"]]:
+        found = best_of(reference, search(client, query))
+        # On a tie the first search's song stays, as it names the artist too
+        if found and (best is None or rank(reference, found) > rank(reference, best)):
+            best = found
+        if best and best[2] == "matched" and not other_recording(best[0], reference):
+            break
+    return best
+
+
+def match_row(track_id: str, track: dict, best) -> dict:
+    row = dict.fromkeys(MATCH_FIELDS, "")
+    row.update(yandex_id=track_id, status="missing", **track)
+    if best is None:
+        return row
+    song, scores, status = best
+    attrs = song["attributes"]
+    row.update(
+        status=status,
+        spotify_id=song["id"],
+        spotify_title=attrs["name"],
+        spotify_artist=attrs["artistName"],
+        spotify_album=attrs["albumName"],
+        spotify_duration=format_duration(attrs["durationInMillis"]),
+        score=f"{scores['total']:.2f}",
+    )
+    return row
+
+
+# --- Local files ---
+
+def load_matches() -> dict[str, dict]:
+    if not os.path.exists(MATCHES_PATH):
+        return {}
+    return {row["yandex_id"]: row for row in read_csv(MATCHES_PATH)}
+
+
+# --- Commands ---
+
+def cmd_match(client: SpotifyClient) -> None:
+    tracks = load_tracks()
+    done = load_matches()
+    search_tracks(client, tracks, load_apple_matches(), done)
+    print_status_summary(done.values())
+
+
+def search_tracks(client: SpotifyClient, tracks: dict, apple: dict, done: dict) -> None:
+    """Search every track not yet in matches.csv, adding rows to it and to done."""
+    todo = [(track_id, track) for track_id, track in tracks.items() if track_id not in done]
+    print(f"{len(tracks)} tracks, {len(todo)} left to search")
+    os.makedirs(SPOTIFY_DIR, exist_ok=True)
+    write_header = not os.path.exists(MATCHES_PATH)
+    started = time.monotonic()
+    # Appending row by row means an interrupted run, or a refused login, resumes where it stopped
+    with open(MATCHES_PATH, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MATCH_FIELDS)
+        if write_header:
+            writer.writeheader()
+        for i, (track_id, track) in enumerate(todo, 1):
+            try:
+                best = find_match(client, reference(track, apple.get(track_id)))
+            except LoginRefused:
+                raise
+            except ApiError as e:
+                # A rerun stops at the same track, so say which one and how to get past it
+                raise ApiError(f"searching '{track['title']}' by {track['artist']} (Yandex track "
+                               f"{track_id}) failed: {e}. To skip it, add the line "
+                               f"'{track_id},,,,,missing' to {MATCHES_PATH}.", e.status) from None
+            done[track_id] = match_row(track_id, track, best)
+            writer.writerow(done[track_id])
+            f.flush()
+            if i % 25 == 0 or i == len(todo):
+                print(progress(i, len(todo), started, "searched"))
