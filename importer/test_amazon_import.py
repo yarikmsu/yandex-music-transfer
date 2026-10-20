@@ -186,6 +186,19 @@ class ClientTest(unittest.TestCase):
                 am.fetch_session(SESSION_COOKIES)
         self.assertEqual(str(raised.exception), am.LOGIN_REFUSED)
 
+    def test_config_refusing_the_cookie_says_to_copy_it_again(self, _sleep):
+        with mock.patch("urllib.request.urlopen", side_effect=refused()):
+            with self.assertRaises(am.ApiError) as raised:
+                am.fetch_session(SESSION_COOKIES)
+        self.assertEqual(str(raised.exception), am.LOGIN_REFUSED)
+
+    def test_config_without_the_device_is_an_amazon_error(self, _sleep):
+        config = {key: value for key, value in SESSION.items() if key != "deviceId"}
+        with mock.patch("urllib.request.urlopen", return_value=http_ok(config)):
+            with self.assertRaises(am.ApiError) as raised:
+                am.fetch_session(SESSION_COOKIES)
+        self.assertIn("deviceId", str(raised.exception))
+
     def test_refused_request_renews_the_session_once_and_retries(self, _sleep):
         client = signed_in_client()
         renewed = {**SESSION, "csrf": {"token": "fresh=", "rnd": "1", "ts": "2"}}
@@ -321,6 +334,29 @@ class MatchCommandTest(InTempDir):
         self.assertEqual((rows["10"]["status"], rows["11"]["asin"]), ("skip", "B11"))
         self.assertEqual(rows["11"]["title"], "Shoot To Thrill (Made Famous By AC/DC)")
 
+    def failing_search(self, error):
+        write_csv("liked_tracks_me.csv", OK_HEADER, [["1", "Linia", "Splean", "", "", "3:00", "10", "OK"]])
+        fake = FakeAmazon()
+
+        def graphql(query, variables):
+            raise error
+
+        fake.graphql = graphql
+        with self.assertRaises(am.ApiError) as raised:
+            am.cmd_match(fake)
+        return str(raised.exception)
+
+    @mock.patch("builtins.print")
+    def test_failed_search_names_the_track(self, _print):
+        message = self.failing_search(am.ApiError("Bad field"))
+        self.assertIn("Linia", message)
+        self.assertIn("10", message)
+        self.assertIn("Bad field", message)
+
+    @mock.patch("builtins.print")
+    def test_refused_login_while_searching_keeps_its_advice(self, _print):
+        self.assertEqual(self.failing_search(am.LoginRefused()), am.LOGIN_REFUSED)
+
 
 @mock.patch("builtins.print")
 class ImportTest(InTempDir):
@@ -402,9 +438,10 @@ class ImportTest(InTempDir):
             return FakeAmazon.graphql(self.fake, query, variables)
 
         self.fake.graphql = graphql
-        with self.assertRaises(am.ApiError):
+        with self.assertRaises(am.ApiError) as raised:
             am.cmd_import(self.fake, apply=True)
         self.assertEqual(am.load_state()["liked"], [asin(12)])
+        self.assertIn(asin(11), str(raised.exception))
 
     def test_like_without_a_result_stops_the_run(self, _print):
         self.fake.graphql = lambda query, variables: (

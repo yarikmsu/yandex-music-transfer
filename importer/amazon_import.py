@@ -41,6 +41,8 @@ REQUIRED_COOKIES = ("session-id", "ubid-main", "at-main", "sess-at-main", "x-mai
 LOGIN_REFUSED = ("Amazon Music did not accept the cookie as a signed-in login. Copy it again from "
                  "a signed-in music.amazon.com tab into run/.amazon.env and run the same command "
                  "again: it continues where it stopped.")
+# What the player's config must give for GraphQL requests to be answered
+SESSION_KEYS = ("deviceId", "deviceType", "sessionId")
 
 # Seconds between requests; likes go slower, as they change the account
 SEARCH_PAUSE = 1.0
@@ -92,9 +94,18 @@ def fetch_session(cookie: str) -> dict:
     player = JsonClient(WEB_PLAYER, {"Cookie": cookie, "Origin": WEB_PLAYER, "Referer": WEB_PLAYER + "/",
                                      "User-Agent": USER_AGENT, "Accept": "*/*"}, 0)
     player.service = "Amazon Music"
-    config = player.request("POST", "/config.json")
+    try:
+        config = player.request("POST", "/config.json")
+    except ApiError as e:
+        if e.status in (401, 403):
+            raise LoginRefused() from None
+        raise
     if not config.get("customerId"):
         raise LoginRefused()
+    missing = [key for key in SESSION_KEYS if not config.get(key)]
+    if missing:
+        raise ApiError(f"music.amazon.com/config.json has no {', '.join(missing)}; "
+                       "the web player may have changed")
     return config
 
 
@@ -323,7 +334,15 @@ def search_tracks(client: AmazonMusicClient, tracks: dict, apple: dict, done: di
         if write_header:
             writer.writeheader()
         for i, (track_id, track) in enumerate(todo, 1):
-            best = find_match(client, reference(track, apple.get(track_id)))
+            try:
+                best = find_match(client, reference(track, apple.get(track_id)))
+            except LoginRefused:
+                raise
+            except ApiError as e:
+                # A rerun stops at the same track, so say which one and how to get past it
+                raise ApiError(f"searching '{track['title']}' by {track['artist']} (Yandex track "
+                               f"{track_id}) failed: {e}. To skip it, add the line "
+                               f"'{track_id},,,,,missing' to {MATCHES_PATH}.", e.status) from None
             done[track_id] = match_row(track_id, track, best)
             writer.writerow(done[track_id])
             f.flush()
@@ -355,7 +374,13 @@ def like_songs(client: AmazonMusicClient, state: dict, songs: list[str]) -> None
     client.pause = max(client.pause, LIKE_PAUSE)
     started = time.monotonic()
     for i, track_asin in enumerate(pending, 1):
-        answer = client.graphql(LIKE_MUTATION, {"trackId": track_asin, "likeState": "LIKE"})
+        try:
+            answer = client.graphql(LIKE_MUTATION, {"trackId": track_asin, "likeState": "LIKE"})
+        except LoginRefused:
+            raise
+        except ApiError as e:
+            raise ApiError(f"liking {WEB_PLAYER}/tracks/{track_asin} failed: {e}; stopped so a "
+                           "rerun keeps the order", e.status) from None
         if not answer.get("setTrackLikeState"):
             raise ApiError(f"liking {track_asin} returned no result; stopped so a rerun keeps the order")
         state["liked"].append(track_asin)
