@@ -396,6 +396,14 @@ class RateLimitTest(unittest.TestCase):
             with self.assertRaises(ai.ApiError):
                 client.request("GET", "/v1/test")
 
+    def test_refused_request_keeps_its_http_status(self):
+        refused = urllib.error.HTTPError("url", 401, "Unauthorized", {}, io.BytesIO(b"no"))
+        client = ai.AppleMusicClient("dev", "user")
+        with mock.patch.object(ai.urllib.request, "urlopen", side_effect=[refused]):
+            with self.assertRaises(ai.ApiError) as raised:
+                client.request("GET", "/v1/test")
+        self.assertEqual(raised.exception.status, 401)
+
 
 class TokensTest(unittest.TestCase):
     def test_placeholder_is_rejected(self):

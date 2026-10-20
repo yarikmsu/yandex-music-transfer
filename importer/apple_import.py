@@ -72,7 +72,9 @@ CYRILLIC_TO_LATIN = str.maketrans({
 # --- Apple Music API ---
 
 class ApiError(Exception):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status  # the HTTP status of a refused request, if any
 
 
 def build_url(base: str, path: str, params: dict | None = None) -> str:
@@ -128,7 +130,7 @@ class JsonClient:
                     wait = _retry_delay(None, failures, 5)
                 else:
                     detail = e.read()[:300].decode(errors="replace")
-                    raise ApiError(f"{method} {path}: HTTP {e.code} {detail}") from None
+                    raise ApiError(f"{method} {path}: HTTP {e.code} {detail}", e.code) from None
                 print(f"  HTTP {e.code}, retrying in {wait}s...")
             except (urllib.error.URLError, TimeoutError) as e:
                 failures += 1
