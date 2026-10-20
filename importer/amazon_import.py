@@ -1,15 +1,14 @@
 """Like every song of a Yandex Music export (the CSVs written by fetch_tracks.py) in Amazon Music.
 
 Run in the export folder:
-  check            confirm the login works
+  check            confirm the login works and show which account it signs in to
   match            search Amazon Music for every exported track; writes amazon/matches.csv
   import           show what would be liked, without changing anything
   import --apply   like every matched song, liked or in a playlist, so it shows up in Liked Songs
 
-Every command but the dry run reads the login from AMAZON_MUSIC_AUTH: the authorization
-header of a request the signed-in music.amazon.com player sends to gql.music.amazon.dev.
+Every command but the dry run reads the login from AMAZON_MUSIC_COOKIE: the cookie header
+of a request the signed-in music.amazon.com player sends to gql.music.amazon.com.
 """
-import base64
 import collections
 import csv
 import json
@@ -25,18 +24,23 @@ from apple_import import (
 from ytmusic_import import best_of, dig, like_order, load_apple_matches, reference
 
 # Amazon's documented Music API is a closed beta; these are the calls its own web
-# player makes, as used by SongMirror (github.com/ahnafnafee/songmirror)
-GQL = "https://gql.music.amazon.dev"
+# player makes (see also SongMirror, github.com/ahnafnafee/songmirror)
+GQL = "https://gql.music.amazon.com"
 WEB_PLAYER = "https://music.amazon.com"
-# The web player's public client ID, from its script bundle; not a secret
-WEB_API_KEY = "amzn1.application.e1dc16675f9f4c78b31927d5bfd5c229"
+# The web player's public client ID, from its requests; not a secret
+WEB_API_KEY = "amzn1.application.4ff5579ca2e3407aba989a1f5dbdaf69"
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
-AUTH_PREFIX = "AmznMusic "
-AUTH_PLACEHOLDER = "paste_here"
-LOGIN_EXPIRED = ("Amazon Music refused the login; it lasts about an hour. Copy a fresh "
-                 "authorization value into run/.amazon.env and run the same command again: "
-                 "it continues where it stopped.")
+              "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
+COOKIE_PLACEHOLDER = "paste_here"
+# The amazon.com session cookies the player signs in with (US marketplace); the
+# browser's analytics and experiment cookies are dropped
+SESSION_COOKIES = ("session-id", "session-id-time", "ubid-main", "at-main", "sess-at-main", "x-main",
+                   "session-token", "sst-main", "at-main-music", "am-token")
+# Without any of these the player answers as if signed out
+REQUIRED_COOKIES = ("session-id", "ubid-main", "at-main", "sess-at-main", "x-main")
+LOGIN_REFUSED = ("Amazon Music did not accept the cookie as a signed-in login. Copy it again from "
+                 "a signed-in music.amazon.com tab into run/.amazon.env and run the same command "
+                 "again: it continues where it stopped.")
 
 # Seconds between requests; likes go slower, as they change the account
 SEARCH_PAUSE = 1.0
@@ -57,13 +61,16 @@ NOT_IMPORTED_FIELDS = [
 STATUSES = ("matched", "check", "missing", "skip")
 ASIN = re.compile(r"[A-Z0-9]{10}")
 
+# A "name" filter matches words of the track title only; an artist filter narrows that down
 SEARCH_QUERY = """
-query SearchTracks($query: String!) {
-  searchTracks(searchOptions: {searchFilters: [{field: "name", query: $query}]}) {
+query SearchTracks($options: SearchTrackOptions!) {
+  searchTracks(searchOptions: $options) {
     edges { node { id title duration album { title } contributingArtists { edges { node { name } } } } }
   }
 }"""
-USER_QUERY = "query User { user { id } }"
+USER_QUERY = "query User { user { id name } }"
+# Liked Songs, latest like first
+LATEST_LIKES_QUERY = "query LatestLikes { user { tracks(limit: 5) { edges { node { id } } } } }"
 # The only write this importer makes. Never NEUTRAL or DISLIKE: nothing is ever unliked
 LIKE_MUTATION = """
 mutation Like($trackId: String!, $likeState: String!) {
@@ -73,19 +80,20 @@ mutation Like($trackId: String!, $likeState: String!) {
 
 # --- Amazon Music API ---
 
-def auth_context(auth: str) -> dict | None:
-    """The device and token JSON inside an AmznMusic authorization value, if it is one."""
-    if not auth.startswith(AUTH_PREFIX):
-        return None
-    try:
-        context = json.loads(base64.b64decode(auth[len(AUTH_PREFIX):], validate=True))
-    except ValueError:
-        return None
-    if not isinstance(context, dict):
-        return None
-    if not all(context.get(key) for key in ("access_token", "deviceId", "deviceType")):
-        return None
-    return context
+class LoginRefused(ApiError):
+    def __init__(self):
+        super().__init__(LOGIN_REFUSED)
+
+
+def fetch_session(cookie: str) -> dict:
+    """The device, session and CSRF values the player's config gives this login."""
+    player = JsonClient(WEB_PLAYER, {"Cookie": cookie, "Origin": WEB_PLAYER, "Referer": WEB_PLAYER + "/",
+                                     "User-Agent": USER_AGENT, "Accept": "*/*"}, 0)
+    player.service = "Amazon Music"
+    config = player.request("POST", "/config.json")
+    if not config.get("customerId"):
+        raise LoginRefused()
+    return config
 
 
 class AmazonMusicClient(JsonClient):
@@ -93,27 +101,43 @@ class AmazonMusicClient(JsonClient):
 
     service = "Amazon Music"
 
-    def __init__(self, auth: str):
-        context = auth_context(auth)
-        headers = {
+    def __init__(self, cookie: str):
+        self.cookie = cookie
+        super().__init__(GQL, {}, SEARCH_PAUSE)
+        self._use(fetch_session(cookie))
+
+    def _use(self, session: dict) -> None:
+        csrf = session.get("csrf") or {}
+        self.headers = {
             "Content-Type": "application/json", "Accept": "application/json",
             "Origin": WEB_PLAYER, "Referer": WEB_PLAYER + "/", "User-Agent": USER_AGENT,
-            "authorization": auth, "x-api-key": WEB_API_KEY,
-            "device-id": context["deviceId"], "device-type": context["deviceType"],
+            "Cookie": self.cookie, "x-api-key": WEB_API_KEY,
+            "x-amzn-device-id": session["deviceId"], "x-amzn-device-type": session["deviceType"],
+            "x-amzn-session-id": session["sessionId"],
+            "music-territory": session.get("musicTerritory") or "US",
+            "csrf-token": str(csrf.get("token", "")), "csrf-rnd": str(csrf.get("rnd", "")),
+            "csrf-ts": str(csrf.get("ts", "")),
         }
-        super().__init__(GQL, headers, SEARCH_PAUSE)
 
     def graphql(self, query: str, variables: dict) -> dict:
+        try:
+            return self._graphql(query, variables)
+        except LoginRefused:
+            # The CSRF values expire; the player fetches new ones the same way
+            self._use(fetch_session(self.cookie))
+            return self._graphql(query, variables)
+
+    def _graphql(self, query: str, variables: dict) -> dict:
         try:
             body = self.request("POST", "/", body={"query": query, "variables": variables})
         except ApiError as e:
             if e.status in (401, 403):
-                raise ApiError(LOGIN_EXPIRED, e.status) from None
+                raise LoginRefused() from None
             raise
         errors = body.get("errors") or []
         codes = [str(dig(error, "extensions", "code") or error.get("code") or "") for error in errors]
         if any(code.startswith("AUTH_") for code in codes):
-            raise ApiError(LOGIN_EXPIRED)
+            raise LoginRefused()
         if errors:
             raise ApiError("; ".join(str(error.get("message", error)) for error in errors))
         return body.get("data") or {}
@@ -139,18 +163,47 @@ def parse_search(data: dict) -> list[dict]:
     return [song for song in (as_song(edge.get("node") or {}) for edge in edges) if song]
 
 
-def search(client: AmazonMusicClient, query: str) -> list[dict]:
-    return parse_search(client.graphql(SEARCH_QUERY, {"query": query}))
+def search(client: AmazonMusicClient, title: str, artist: str | None = None) -> list[dict]:
+    filters = [{"field": "name", "query": title}]
+    if artist:
+        filters.append({"field": "artist", "query": artist})
+    return parse_search(client.graphql(SEARCH_QUERY, {"options": {"searchFilters": filters}}))
+
+
+# --- Login ---
+
+def load_login() -> str:
+    """The session cookies of the copied cookie header; messages never include them."""
+    cookie = os.environ.get("AMAZON_MUSIC_COOKIE", "").strip().strip("'\"")
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie[len("cookie:"):].strip().strip("'\"")
+    if not cookie or cookie == COOKIE_PLACEHOLDER:
+        sys.exit("Set AMAZON_MUSIC_COOKIE first (see run/.amazon.env).")
+    # Python would refuse to send such a header and print it, whole, in the error
+    if not (cookie.isascii() and cookie.isprintable()):
+        sys.exit("AMAZON_MUSIC_COOKIE contains a line break or another unusual character. "
+                 "Copy it again, as one line.")
+    values = {}
+    for part in cookie.split(";"):
+        name, _, value = part.strip().partition("=")
+        if name in SESSION_COOKIES and value:
+            values[name] = value
+    missing = [name for name in REQUIRED_COOKIES if name not in values]
+    if missing:
+        sys.exit(f"AMAZON_MUSIC_COOKIE has no {', '.join(missing)} value. Copy the whole cookie "
+                 "header of a request from a signed-in music.amazon.com tab.")
+    return "; ".join(f"{name}={value}" for name, value in values.items())
 
 
 # --- Matching (the rules are YouTube Music's: ytmusic_import.best_of) ---
 
 def find_match(client: AmazonMusicClient, reference: dict) -> tuple[dict, dict, str] | None:
-    """Songs by title and artist, then by title alone; stops at a match."""
-    with_artist = f"{reference['title']} {reference['artist'].split(', ')[0]}"
+    """Songs by title and first artist, then by title alone, which finds artists Amazon
+    spells otherwise; stops at a match."""
+    first_artist = reference["artist"].split(", ")[0]
     candidates, best = [], None
-    for query in (with_artist, reference["title"]):
-        candidates += search(client, query)
+    for artist in ([first_artist] if first_artist else []) + [None]:
+        candidates += search(client, reference["title"], artist)
         best = best_of(reference, candidates)
         if best and best[2] == "matched":
             break
@@ -259,16 +312,19 @@ def search_tracks(client: AmazonMusicClient, tracks: dict, apple: dict, done: di
                 print(progress(i, len(todo), started, "searched"))
 
 
-def account_id(client: AmazonMusicClient) -> str:
-    user_id = dig(client.graphql(USER_QUERY, {}), "user", "id")
-    if not user_id:
-        raise ApiError("the login is not signed in; copy it again from a signed-in "
-                       "music.amazon.com tab")
-    return user_id
+def account_name(client: AmazonMusicClient) -> str:
+    user = dig(client.graphql(USER_QUERY, {}), "user") or {}
+    if not user.get("id"):
+        raise LoginRefused()
+    return user.get("name") or user["id"]
 
 
 def cmd_check(client: AmazonMusicClient) -> None:
-    print(f"Login works. Signed in to Amazon Music as account {account_id(client)}")
+    print(f"Cookie works. Signed in to Amazon Music as {account_name(client)}")
+
+
+def latest_like(client: AmazonMusicClient) -> str | None:
+    return dig(client.graphql(LATEST_LIKES_QUERY, {}), "user", "tracks", "edges", 0, "node", "id")
 
 
 def like_songs(client: AmazonMusicClient, state: dict, songs: list[str]) -> None:
@@ -285,6 +341,11 @@ def like_songs(client: AmazonMusicClient, state: dict, songs: list[str]) -> None
             raise ApiError(f"liking {track_asin} returned no result; stopped so a rerun keeps the order")
         state["liked"].append(track_asin)
         save_state(state)
+        # The order assumes Liked Songs lists the latest like first; confirm it before going on
+        if i == 2 and latest_like(client) != track_asin:
+            raise ApiError("Liked Songs does not list the latest like first, so the newest Yandex "
+                           "likes would end up at the bottom. Stopped after 2 likes; see 'Order' "
+                           "in importer/AMAZON_MUSIC.md.")
         if i % 50 == 0 or i == len(pending):
             print(progress(i, len(pending), started, "liked"))
     print(f"  Liked Songs: {len(state['liked'])} songs liked by this importer")
@@ -332,29 +393,9 @@ def cmd_import(client: AmazonMusicClient | None, apply: bool) -> None:
     if problems:
         # Likes cannot be reordered later, so every track needs its decision first
         sys.exit("Nothing liked: settle the rows above first.")
-    print(f"Signed in as account {account_id(client)}")
+    print(f"Signed in as {account_name(client)}")
     like_songs(client, load_state(), songs)
     print("Done.")
-
-
-# --- Login ---
-
-def load_login() -> str:
-    """The authorization value; messages never include it."""
-    auth = os.environ.get("AMAZON_MUSIC_AUTH", "").strip().strip("'\"")
-    if auth.lower().startswith("authorization:"):
-        auth = auth[len("authorization:"):].strip().strip("'\"")
-    if not auth or auth == AUTH_PLACEHOLDER:
-        sys.exit("Set AMAZON_MUSIC_AUTH first (see run/.amazon.env).")
-    # Python would refuse to send such a header and print it, whole, in the error
-    if not (auth.isascii() and auth.isprintable()):
-        sys.exit("AMAZON_MUSIC_AUTH contains a line break or another unusual character. "
-                 "Copy it again, as one line.")
-    if auth_context(auth) is None:
-        sys.exit("AMAZON_MUSIC_AUTH is not the authorization value of a gql.music.amazon.dev "
-                 "request (it starts with 'AmznMusic '). Copy it again from a signed-in "
-                 "music.amazon.com tab.")
-    return auth
 
 
 def main(argv: list[str]) -> int:

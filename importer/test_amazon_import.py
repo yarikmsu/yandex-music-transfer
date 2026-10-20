@@ -1,4 +1,3 @@
-import base64
 import csv
 import io
 import json
@@ -13,20 +12,20 @@ import amazon_import as am
 OK_HEADER = ["#", "Title", "Artist", "Album", "Year", "Duration", "ID", "Availability"]
 APPLE_HEADER = ["yandex_id", "title", "artist", "album", "duration", "status",
                 "apple_id", "apple_title", "apple_artist", "apple_album", "apple_duration", "score"]
-CONTEXT = {"deviceId": "14534074384711863", "deviceType": "A16ZV8BU3SN1N3", "access_token": "Atna|secret"}
-
-
-def auth_value(context=None):
-    """An authorization header value the way the web player sends it."""
-    payload = json.dumps(CONTEXT if context is None else context).encode()
-    return "AmznMusic " + base64.b64encode(payload).decode()
+SESSION_COOKIES = "session-id=142-1-2; ubid-main=131-4-5; at-main=Atza|secretA; sess-at-main=secretS; x-main=secretX"
+# What the browser sends: the session cookies among analytics and experiment ones
+COPIED_COOKIE = ("session-id=142-1-2; am-loader-experiment=EXP; ubid-main=131-4-5; lc-main=en_US; "
+                 "at-main=Atza|secretA; sess-at-main=secretS; x-main=secretX; __Secure-id_dbp=Dbsc|secretD")
+SESSION = {"deviceId": "14226794074016810", "deviceType": "A16ZV8BU3SN1N3", "sessionId": "142-1-2",
+           "customerId": "CUSTOMER", "musicTerritory": "US",
+           "csrf": {"token": "csrftoken=", "rnd": "918336372", "ts": "1792472957"}}
 
 
 def node(asin, title, artists, seconds, album=""):
-    """A searchTracks result in the shape gql.music.amazon.dev returns it."""
-    edges = [{"role": "PRIMARY", "node": {"id": f"artist-{name}", "name": name}} for name in artists]
-    return {"id": asin, "title": title, "isrc": "RUA000000001", "duration": seconds,
-            "album": {"id": "album-1", "title": album}, "contributingArtists": {"edges": edges}}
+    """A searchTracks result in the shape gql.music.amazon.com returns it."""
+    edges = [{"node": {"name": name}} for name in artists]
+    return {"id": asin, "title": title, "duration": seconds,
+            "album": {"title": album}, "contributingArtists": {"edges": edges}}
 
 
 def search_data(*nodes):
@@ -44,6 +43,15 @@ def http_ok(payload):
     return ok
 
 
+def refused():
+    return urllib.error.HTTPError("url", 401, "Unauthorized", {}, io.BytesIO(b'{"errors": []}'))
+
+
+def signed_in_client():
+    with mock.patch.object(am, "fetch_session", return_value=SESSION):
+        return am.AmazonMusicClient(SESSION_COOKIES)
+
+
 def track(title, artist, duration="3:31", album=""):
     return {"title": title, "artist": artist, "album": album, "duration": duration}
 
@@ -55,30 +63,49 @@ def write_csv(path, header, rows):
         writer.writerows(rows)
 
 
+def filters_of(variables):
+    """(title, artist or None) of a search request."""
+    filters = variables["options"]["searchFilters"]
+    return filters[0]["query"], filters[1]["query"] if len(filters) > 1 else None
+
+
 class FakeAmazon:
-    """Answers searches from `answers`, keyed by query text, and records every call."""
+    """Answers searches from `answers`, keyed by (title, artist or None), keeps Liked Songs
+    newest first, and records every call."""
+
+    pause = am.SEARCH_PAUSE
 
     def __init__(self, answers=None):
         self.answers = answers or {}
         self.calls = []
-
-    pause = am.SEARCH_PAUSE
+        self.liked_songs = []
 
     def graphql(self, query, variables):
         self.calls.append((query, variables))
         if query == am.SEARCH_QUERY:
-            return search_data(*self.answers.get(variables["query"], []))
+            return search_data(*self.answers.get(filters_of(variables), []))
         if query == am.USER_QUERY:
-            return {"user": {"id": "amzn1.account.TEST"}}
+            return {"user": {"id": "amzn1.account.TEST", "name": "Test User"}}
         if query == am.LIKE_MUTATION:
-            return {"setTrackLikeState": {"__typename": "SetTrackLikeStateResponse"}}
+            self.liked_songs.insert(0, variables["trackId"])
+            return {"setTrackLikeState": {"__typename": "SetUserTrackLikeStateResponse"}}
+        if query == am.LATEST_LIKES_QUERY:
+            return {"user": {"tracks": {"edges": [{"node": {"id": s}} for s in self.liked_songs]}}}
         return {}
 
     def queries(self):
-        return [variables["query"] for query, variables in self.calls if query == am.SEARCH_QUERY]
+        return [filters_of(variables) for query, variables in self.calls if query == am.SEARCH_QUERY]
 
     def liked(self):
         return [variables["trackId"] for query, variables in self.calls if query == am.LIKE_MUTATION]
+
+
+class InTempDir(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(tmp.name)
 
 
 def asin(n):
@@ -89,14 +116,6 @@ def asin(n):
 def match(track_id, status, track_asin=""):
     return {**dict.fromkeys(am.MATCH_FIELDS, ""), "yandex_id": track_id, "status": status,
             "asin": track_asin}
-
-
-class InTempDir(unittest.TestCase):
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.addCleanup(os.chdir, os.getcwd())
-        os.chdir(tmp.name)
 
 
 class SearchParsingTest(unittest.TestCase):
@@ -120,74 +139,109 @@ class SearchParsingTest(unittest.TestCase):
         self.assertEqual(am.parse_search(search_data(node("", "Song", ["Band"], 180))), [])
 
 
+@mock.patch.object(am.time, "sleep")
 class ClientTest(unittest.TestCase):
-    @mock.patch.object(am.time, "sleep")
-    def test_search_sends_the_login_only_to_amazon_music(self, sleep):
-        client = am.AmazonMusicClient(auth_value())
+    def test_requests_carry_the_session_the_player_uses(self, sleep):
+        client = signed_in_client()
         reply = http_ok({"data": search_data(node("B1", "Линия жизни", ["Сплин"], 183))})
         with mock.patch("urllib.request.urlopen", return_value=reply) as urlopen:
-            found = am.search(client, "Линия жизни Сплин")
+            found = am.search(client, "Линия жизни", "Сплин")
         self.assertEqual([song["id"] for song in found], ["B1"])
         sent = urlopen.call_args.args[0]
-        self.assertTrue(sent.full_url.startswith("https://gql.music.amazon.dev"))
-        self.assertEqual(sent.get_header("Authorization"), auth_value())
+        self.assertTrue(sent.full_url.startswith("https://gql.music.amazon.com/"))
+        self.assertEqual(sent.get_header("Cookie"), SESSION_COOKIES)
         self.assertEqual(sent.get_header("X-api-key"), am.WEB_API_KEY)
-        self.assertEqual(sent.get_header("Device-id"), CONTEXT["deviceId"])
-        self.assertEqual(sent.get_header("Device-type"), CONTEXT["deviceType"])
-        self.assertIsNone(sent.get_header("Cookie"))
-        self.assertEqual(json.loads(sent.data)["variables"], {"query": "Линия жизни Сплин"})
+        self.assertEqual(sent.get_header("X-amzn-device-id"), SESSION["deviceId"])
+        self.assertEqual(sent.get_header("X-amzn-session-id"), SESSION["sessionId"])
+        self.assertEqual(sent.get_header("Csrf-token"), SESSION["csrf"]["token"])
+        self.assertEqual(sent.get_header("Music-territory"), "US")
+        filters = json.loads(sent.data)["variables"]["options"]["searchFilters"]
+        self.assertEqual(filters, [{"field": "name", "query": "Линия жизни"}, {"field": "artist", "query": "Сплин"}])
         self.assertEqual(sleep.call_args.args[0], am.SEARCH_PAUSE)
 
-    @mock.patch.object(am.time, "sleep")
-    def test_graphql_error_raises(self, _sleep):
-        client = am.AmazonMusicClient(auth_value())
+    def test_title_alone_is_one_filter(self, _sleep):
+        client = signed_in_client()
+        with mock.patch("urllib.request.urlopen", return_value=http_ok({"data": {}})) as urlopen:
+            am.search(client, "Линия жизни")
+        filters = json.loads(urlopen.call_args.args[0].data)["variables"]["options"]["searchFilters"]
+        self.assertEqual(filters, [{"field": "name", "query": "Линия жизни"}])
+
+    def test_session_comes_from_the_player_config(self, _sleep):
+        with mock.patch("urllib.request.urlopen", return_value=http_ok(SESSION)) as urlopen:
+            self.assertEqual(am.fetch_session(SESSION_COOKIES), SESSION)
+        sent = urlopen.call_args.args[0]
+        self.assertEqual((sent.full_url, sent.get_method()), ("https://music.amazon.com/config.json", "POST"))
+        self.assertEqual(sent.get_header("Cookie"), SESSION_COOKIES)
+
+    def test_config_without_a_customer_means_the_cookie_is_not_signed_in(self, _sleep):
+        with mock.patch("urllib.request.urlopen", return_value=http_ok({**SESSION, "customerId": ""})):
+            with self.assertRaises(am.ApiError) as raised:
+                am.fetch_session(SESSION_COOKIES)
+        self.assertEqual(str(raised.exception), am.LOGIN_REFUSED)
+
+    def test_refused_request_renews_the_session_once_and_retries(self, _sleep):
+        client = signed_in_client()
+        renewed = {**SESSION, "csrf": {"token": "fresh=", "rnd": "1", "ts": "2"}}
+        replies = [refused(), http_ok({"data": {"user": {"id": "u"}}})]
+        with mock.patch.object(am, "fetch_session", return_value=renewed) as fetch, \
+                mock.patch("urllib.request.urlopen", side_effect=replies) as urlopen:
+            self.assertEqual(client.graphql(am.USER_QUERY, {}), {"user": {"id": "u"}})
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(urlopen.call_args.args[0].get_header("Csrf-token"), "fresh=")
+
+    def test_refused_after_renewal_says_to_copy_the_cookie_again(self, _sleep):
+        client = signed_in_client()
+        with mock.patch.object(am, "fetch_session", return_value=SESSION), \
+                mock.patch("urllib.request.urlopen", side_effect=[refused(), refused()]):
+            with self.assertRaises(am.ApiError) as raised:
+                client.graphql(am.USER_QUERY, {})
+        self.assertEqual(str(raised.exception), am.LOGIN_REFUSED)
+
+    def test_auth_error_in_the_answer_counts_as_refused(self, _sleep):
+        client = signed_in_client()
+        anonymous = {"data": None, "errors": [{"extensions": {"code": "AUTH_CLIENT_NOT_ANONYMOUS_ALLOW_LISTED"}}]}
+        with mock.patch.object(am, "fetch_session", return_value=SESSION), \
+                mock.patch("urllib.request.urlopen", side_effect=[http_ok(anonymous), http_ok(anonymous)]):
+            with self.assertRaises(am.ApiError) as raised:
+                client.graphql(am.USER_QUERY, {})
+        self.assertEqual(str(raised.exception), am.LOGIN_REFUSED)
+
+    def test_other_graphql_error_raises_its_message(self, _sleep):
+        client = signed_in_client()
         reply = http_ok({"data": None, "errors": [{"message": "Bad field", "extensions": {"code": "BAD"}}]})
         with mock.patch("urllib.request.urlopen", return_value=reply):
             with self.assertRaises(am.ApiError) as raised:
-                client.graphql(am.SEARCH_QUERY, {"query": "x"})
+                client.graphql(am.USER_QUERY, {})
         self.assertIn("Bad field", str(raised.exception))
-
-    @mock.patch.object(am.time, "sleep")
-    def test_auth_error_says_to_copy_a_fresh_login(self, _sleep):
-        client = am.AmazonMusicClient(auth_value())
-        reply = http_ok({"data": None, "errors": [{"message": "x", "extensions": {"code": "AUTH_TOKEN_EXPIRED"}}]})
-        with mock.patch("urllib.request.urlopen", return_value=reply):
-            with self.assertRaises(am.ApiError) as raised:
-                client.graphql(am.SEARCH_QUERY, {"query": "x"})
-        self.assertEqual(str(raised.exception), am.LOGIN_EXPIRED)
-
-    @mock.patch.object(am.time, "sleep")
-    def test_refused_request_says_to_copy_a_fresh_login(self, _sleep):
-        client = am.AmazonMusicClient(auth_value())
-        refused = urllib.error.HTTPError("url", 401, "Unauthorized", {}, io.BytesIO(b'{"errors": []}'))
-        with mock.patch("urllib.request.urlopen", side_effect=[refused]):
-            with self.assertRaises(am.ApiError) as raised:
-                client.graphql(am.SEARCH_QUERY, {"query": "x"})
-        self.assertEqual(str(raised.exception), am.LOGIN_EXPIRED)
 
 
 class MatchTest(unittest.TestCase):
     def test_same_song_is_matched_from_the_first_search(self):
-        fake = FakeAmazon({"Линия жизни Сплин": [node("B1", "Линия жизни", ["Сплин"], 183)]})
+        fake = FakeAmazon({("Линия жизни", "Сплин"): [node("B1", "Линия жизни", ["Сплин"], 183)]})
         song, _, status = am.find_match(fake, track("Линия жизни", "Сплин", "3:02"))
         self.assertEqual((song["id"], status), ("B1", "matched"))
-        self.assertEqual(fake.queries(), ["Линия жизни Сплин"])
+        self.assertEqual(fake.queries(), [("Линия жизни", "Сплин")])
 
     def test_title_alone_finds_an_artist_spelled_otherwise(self):
-        fake = FakeAmazon({"Линия жизни": [node("B2", "Линия жизни", ["Splean"], 183)]})
+        fake = FakeAmazon({("Линия жизни", None): [node("B2", "Линия жизни", ["Splean"], 183)]})
         song, _, status = am.find_match(fake, track("Линия жизни", "Сплин", "3:03"))
         self.assertEqual((song["id"], status), ("B2", "matched"))
-        self.assertEqual(fake.queries(), ["Линия жизни Сплин", "Линия жизни"])
+        self.assertEqual(fake.queries(), [("Линия жизни", "Сплин"), ("Линия жизни", None)])
+
+    def test_first_of_several_artists_filters_the_search(self):
+        fake = FakeAmazon()
+        am.find_match(fake, track("Numb / Encore", "Linkin Park, JAY-Z"))
+        self.assertEqual(fake.queries()[0], ("Numb / Encore", "Linkin Park"))
 
     def test_karaoke_copy_is_only_check(self):
-        fake = FakeAmazon({"San Francisco Scott McKenzie": [
+        fake = FakeAmazon({("San Francisco", "Scott McKenzie"): [
             node("B3", "San Francisco", ["Scott McKenzie (Karaoke)"], 174, "Zoom Karaoke")]})
         _, _, status = am.find_match(fake, track("San Francisco", "Scott McKenzie", "2:53"))
         self.assertEqual(status, "check")
 
     def test_match_row_names_the_amazon_song(self):
         exported = track("Линия жизни", "Сплин", "3:02")
-        best = am.find_match(FakeAmazon({"Линия жизни Сплин": [
+        best = am.find_match(FakeAmazon({("Линия жизни", "Сплин"): [
             node("B1", "Линия жизни", ["Сплин"], 183, "25 кадр")]}), exported)
         row = am.match_row("10", exported, best)
         self.assertEqual((row["yandex_id"], row["status"], row["asin"], row["amazon_album"], row["amazon_duration"]),
@@ -211,9 +265,9 @@ class MatchCommandTest(InTempDir):
             ["11", "", "", "", "", "matched", "1", "Shoot to Thrill", "AC/DC", "Back in Black", "5:17", "1"]])
         os.makedirs(am.AMAZON_DIR)
         am.write_matches({"10": {**dict.fromkeys(am.MATCH_FIELDS, ""), "yandex_id": "10", "status": "skip"}})
-        fake = FakeAmazon({"Shoot to Thrill AC/DC": [node("B11", "Shoot to Thrill", ["AC/DC"], 317)]})
+        fake = FakeAmazon({("Shoot to Thrill", "AC/DC"): [node("B11", "Shoot to Thrill", ["AC/DC"], 317)]})
         am.cmd_match(fake)
-        self.assertEqual(fake.queries(), ["Shoot to Thrill AC/DC"])
+        self.assertEqual(fake.queries(), [("Shoot to Thrill", "AC/DC")])
         rows = am.load_matches()
         self.assertEqual(list(rows), ["10", "11"])
         self.assertEqual((rows["10"]["status"], rows["11"]["asin"]), ("skip", "B11"))
@@ -248,13 +302,28 @@ class ImportTest(InTempDir):
     def test_apply_likes_newest_last_and_only_ever_sets_like(self, _print):
         am.cmd_import(self.fake, apply=True)
         self.assertEqual(self.fake.liked(), [asin(12), asin(11), asin(10)])
-        self.assertEqual({query for query, _ in self.fake.calls}, {am.USER_QUERY, am.LIKE_MUTATION})
+        self.assertEqual({query for query, _ in self.fake.calls},
+                         {am.USER_QUERY, am.LIKE_MUTATION, am.LATEST_LIKES_QUERY})
         self.assertEqual({v["likeState"] for q, v in self.fake.calls if q == am.LIKE_MUTATION}, {"LIKE"})
         self.assertEqual(am.load_state()["liked"], [asin(12), asin(11), asin(10)])
 
     def test_likes_go_slower_than_searches(self, _print):
         am.cmd_import(self.fake, apply=True)
         self.assertEqual(self.fake.pause, am.LIKE_PAUSE)
+
+    def test_liked_songs_in_another_order_stops_after_two_likes(self, _print):
+        oldest_first = FakeAmazon.graphql
+
+        def graphql(query, variables):
+            answer = oldest_first(self.fake, query, variables)
+            if query == am.LATEST_LIKES_QUERY:
+                answer["user"]["tracks"]["edges"].reverse()
+            return answer
+
+        self.fake.graphql = graphql
+        with self.assertRaises(am.ApiError):
+            am.cmd_import(self.fake, apply=True)
+        self.assertEqual(am.load_state()["liked"], [asin(12), asin(11)])
 
     def test_apply_refuses_while_rows_need_a_check(self, _print):
         self.rows["13"] = match("13", "check", asin(13))
@@ -297,7 +366,7 @@ class ImportTest(InTempDir):
         self.assertFalse(os.path.exists(am.STATE_PATH))
 
     def test_dry_run_needs_no_login(self, _print):
-        with mock.patch.dict(os.environ, {"AMAZON_MUSIC_AUTH": ""}):
+        with mock.patch.dict(os.environ, {"AMAZON_MUSIC_COOKIE": ""}):
             self.assertEqual(am.main(["amazon_import.py", "import"]), 0)
             with self.assertRaises(SystemExit):
                 am.main(["amazon_import.py", "import", "--apply"])
@@ -310,49 +379,44 @@ class ImportTest(InTempDir):
 
 
 class CheckTest(unittest.TestCase):
-    def test_account_id_is_read_from_the_user(self):
-        self.assertEqual(am.account_id(FakeAmazon()), "amzn1.account.TEST")
+    def test_account_name_is_read_from_the_user(self):
+        self.assertEqual(am.account_name(FakeAmazon()), "Test User")
 
     def test_answer_without_a_user_raises(self):
         client = mock.Mock()
         client.graphql.return_value = {"user": None}
         with self.assertRaises(am.ApiError):
-            am.account_id(client)
+            am.account_name(client)
 
 
 class LoginTest(unittest.TestCase):
     def load(self, value):
-        with mock.patch.dict(os.environ, {"AMAZON_MUSIC_AUTH": value}):
+        with mock.patch.dict(os.environ, {"AMAZON_MUSIC_COOKIE": value}):
             return am.load_login()
 
     def assert_rejected_without_echo(self, value):
         with self.assertRaises(SystemExit) as raised:
             self.load(value)
-        message = str(raised.exception.code)
-        self.assertNotIn("secret", message)
-        self.assertNotIn(value.split()[-1], message)
+        self.assertNotIn("secret", str(raised.exception.code))
 
-    def test_copied_header_value_is_accepted(self):
-        self.assertEqual(self.load(auth_value()), auth_value())
+    def test_only_the_session_cookies_are_kept(self):
+        self.assertEqual(self.load(COPIED_COOKIE), SESSION_COOKIES)
 
     def test_copied_header_name_and_quotes_are_dropped(self):
-        self.assertEqual(self.load(f"authorization: '{auth_value()}'"), auth_value())
+        self.assertEqual(self.load(f"cookie: '{COPIED_COOKIE}'"), SESSION_COOKIES)
 
     def test_placeholder_is_rejected(self):
         with self.assertRaises(SystemExit):
             self.load("paste_here")
 
-    def test_value_of_another_kind_is_rejected_without_echoing_it(self):
-        self.assert_rejected_without_echo("Bearer secretvalue")
+    def test_cookie_without_a_session_cookie_is_rejected_without_echoing_it(self):
+        with self.assertRaises(SystemExit) as raised:
+            self.load(COPIED_COOKIE.replace("x-main=secretX; ", ""))
+        self.assertIn("x-main", str(raised.exception.code))
+        self.assertNotIn("secret", str(raised.exception.code))
 
-    def test_value_without_an_access_token_is_rejected_without_echoing_it(self):
-        self.assert_rejected_without_echo(auth_value({"deviceId": "secret1", "deviceType": "secret2"}))
-
-    def test_value_that_is_not_base64_json_is_rejected_without_echoing_it(self):
-        self.assert_rejected_without_echo("AmznMusic secret!!not-base64")
-
-    def test_value_with_a_line_break_is_rejected_without_echoing_it(self):
-        self.assert_rejected_without_echo(auth_value() + "\rsecret")
+    def test_cookie_with_a_line_break_is_rejected_without_echoing_it(self):
+        self.assert_rejected_without_echo(COPIED_COOKIE + "\rsecret")
 
 
 if __name__ == "__main__":

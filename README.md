@@ -16,7 +16,7 @@ Python standard library.
 - An Apple Music subscription, a YouTube Music account (the free tier is enough), or
   an Amazon Music account
 - Chrome or another browser with developer tools, to copy the Apple Music tokens, the
-  YouTube Music cookie or the Amazon Music authorization value
+  YouTube Music cookie or the Amazon Music cookie
 
 ## 1. Export from Yandex Music
 
@@ -88,14 +88,13 @@ are looked for on YouTube too.
 This works with or without the other imports; as for YouTube, the songs you picked by
 hand in `out/apple/matches.csv` are looked for on Amazon too.
 
-1. `cp run/amazon.env.example run/.amazon.env` and paste the authorization value of a
-   signed-in music.amazon.com session into it; [importer/AMAZON_MUSIC.md](importer/AMAZON_MUSIC.md)
-   shows where to find it. It expires after about an hour: when a command says so, paste
-   a fresh one and run the same command again.
+1. `cp run/amazon.env.example run/.amazon.env` and paste the cookie of a signed-in
+   music.amazon.com session into it; [importer/AMAZON_MUSIC.md](importer/AMAZON_MUSIC.md)
+   shows where to find it.
 2. Run:
 
    ```
-   bash run/amazon.sh check            # login works? shows the account ID
+   bash run/amazon.sh check            # cookie works? shows the account
    bash run/amazon.sh match            # writes out/amazon/matches.csv
    bash run/amazon.sh import           # dry run
    bash run/amazon.sh import --apply   # like the matched songs
@@ -119,9 +118,9 @@ hand in `out/apple/matches.csv` are looked for on Amazon too.
 - The YouTube Music cookie is a full Google login. It reaches the container only for
   `check` and `import --apply` and is sent only to music.youtube.com; searches go
   without it. The importer only ever likes songs: it never unlikes or removes anything.
-- The Amazon Music authorization value is the web player's own access token, which
-  expires after about an hour; no amazon.com cookie is ever needed. It is sent only to
-  gql.music.amazon.dev, and the importer, too, only ever likes songs.
+- The Amazon Music cookie is your amazon.com login, shopping included. Only its session
+  cookies are kept, and they are sent only to music.amazon.com and gql.music.amazon.com.
+  This importer, too, only ever likes songs.
 - None of these services officially supports access this way, so any of them may
   block it at any time.
 

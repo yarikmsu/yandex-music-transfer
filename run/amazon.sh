@@ -12,7 +12,7 @@ login=()
 if [[ "${1:-}" != "import" || " $* " == *" --apply "* ]]; then
   # Comments mention the placeholder too, so only settings count
   if [[ ! -f "$ENV_FILE" ]] || grep -q '^[^#]*paste_here' "$ENV_FILE"; then
-    echo "Copy run/amazon.env.example to $ENV_FILE and put your music.amazon.com authorization value into it." >&2
+    echo "Copy run/amazon.env.example to $ENV_FILE and put your music.amazon.com cookie into it." >&2
     exit 1
   fi
   login=(--env-file "$ENV_FILE")
