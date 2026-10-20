@@ -359,10 +359,20 @@ class ClientTest(unittest.TestCase):
     @mock.patch.object(sp.time, "time", return_value=NOW)
     def test_other_graphql_errors_are_spotify_errors(self, _time, _sleep):
         client = self.client([("TOKEN", NOW + 3000)])
-        with mock.patch("urllib.request.urlopen", return_value=http_ok({"errors": [{"message": "boom"}]})):
+        with mock.patch("urllib.request.urlopen", return_value=http_ok({"errors": [{"message": "boom"}]})) as urlopen:
             with self.assertRaises(sp.ApiError) as raised:
                 client.graphql("searchTracks", {})
         self.assertIn("boom", str(raised.exception))
+        self.assertEqual(urlopen.call_count, sp.MAX_ATTEMPTS)
+
+    @mock.patch.object(sp.time, "time", return_value=NOW)
+    def test_failed_backend_call_is_retried(self, _time, _sleep):
+        # Spotify reports its own backend failures as errors in an HTTP 200 answer
+        client = self.client([("TOKEN", NOW + 3000)])
+        failed = http_ok({"errors": [{"message": "Exception while fetching data (/searchV2) : Failed call to search-api"}],
+                          "data": {"searchV2": None}})
+        with mock.patch("urllib.request.urlopen", side_effect=[failed, http_ok({"data": {"x": 1}})]):
+            self.assertEqual(client.graphql("searchTracks", {}), {"x": 1})
 
 
 class MatchTest(unittest.TestCase):

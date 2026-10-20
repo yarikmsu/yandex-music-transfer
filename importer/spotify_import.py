@@ -26,7 +26,7 @@ from typing import NamedTuple
 
 from amazon_import import best_of, other_recording, rank
 from apple_import import (
-    MAX_ATTEMPTS, ApiError, JsonClient, format_duration, load_collections, load_tracks,
+    MAX_ATTEMPTS, ApiError, JsonClient, _retry_delay, format_duration, load_collections, load_tracks,
     print_status_summary, progress, read_csv,
 )
 from ytmusic_import import dig, like_order, load_apple_matches, reference
@@ -244,27 +244,37 @@ class SpotifyClient(JsonClient):
             self._renew()
         body = {"operationName": operation, "variables": variables,
                 "extensions": {"persistedQuery": {"version": 1, "sha256Hash": self.player.hashes[operation]}}}
+        failures = 0
+        while True:
+            errors = (answer := self._send(body)).get("errors") or []
+            if not errors:
+                return answer.get("data") or {}
+            if "PersistedQueryNotFound" in json.dumps(errors):
+                raise PlayerChanged(f"Spotify no longer knows the {operation} request")
+            messages = "; ".join(str(error.get("message", error)) if isinstance(error, dict) else str(error)
+                                 for error in errors)
+            # Spotify's own backend failures come back this way, in an HTTP 200 answer
+            failures += 1
+            if failures >= MAX_ATTEMPTS:
+                raise ApiError(f"{operation}: {messages}")
+            wait = _retry_delay(None, failures, 5)
+            print(f"  Spotify error ({messages}), retrying in {wait}s...")
+            time.sleep(wait)
+
+    def _send(self, body: dict) -> dict:
         try:
-            answer = self.request("POST", QUERY_PATH, body=body)
+            return self.request("POST", QUERY_PATH, body=body)
         except ApiError as e:
             if e.status not in (401, 403):
                 raise
-            # A token can be revoked early; the player then fetches a new one the same way
-            self._renew()
-            try:
-                answer = self.request("POST", QUERY_PATH, body=body)
-            except ApiError as e:
-                if e.status in (401, 403):
-                    raise LoginRefused() from None
-                raise
-        errors = answer.get("errors") or []
-        if "PersistedQueryNotFound" in json.dumps(errors):
-            raise PlayerChanged(f"Spotify no longer knows the {operation} request")
-        if errors:
-            messages = (str(error.get("message", error)) if isinstance(error, dict) else str(error)
-                        for error in errors)
-            raise ApiError(f"{operation}: {'; '.join(messages)}")
-        return answer.get("data") or {}
+        # A token can be revoked early; the player then fetches a new one the same way
+        self._renew()
+        try:
+            return self.request("POST", QUERY_PATH, body=body)
+        except ApiError as e:
+            if e.status in (401, 403):
+                raise LoginRefused() from None
+            raise
 
 
 def as_song(data) -> dict | None:
