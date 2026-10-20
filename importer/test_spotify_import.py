@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.parse
+import urllib.request
 from unittest import mock
 
 import spotify_import as sp
@@ -615,6 +616,28 @@ class CheckTest(unittest.TestCase):
         fake.graphql = lambda operation, variables: {"me": None}
         with self.assertRaises(sp.LoginRefused):
             sp.cmd_check(fake)
+
+
+class RedirectTest(unittest.TestCase):
+    def redirect(self, url, to):
+        request = urllib.request.Request(url, headers={"Cookie": "sp_dc=SPDC"})
+        return sp.SameHostRedirects().redirect_request(request, io.BytesIO(b""), 302, "Found", {}, to)
+
+    def test_redirect_to_another_host_is_refused(self):
+        for to in ("https://evil.example/api/token", "http://open.spotify.com/api/token"):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.redirect("https://open.spotify.com/api/token", to)
+
+    def test_redirect_on_the_same_host_is_followed(self):
+        followed = self.redirect("https://open.spotify.com/", "https://open.spotify.com/intl-de/")
+        self.assertEqual(followed.full_url, "https://open.spotify.com/intl-de/")
+
+    @mock.patch("builtins.print")
+    def test_main_installs_the_redirect_guard(self, _print):
+        with mock.patch("urllib.request.install_opener") as install:
+            sp.main(["spotify_import.py"])
+        handlers = install.call_args.args[0].handlers
+        self.assertTrue(any(isinstance(h, sp.SameHostRedirects) for h in handlers))
 
 
 @mock.patch("builtins.print")

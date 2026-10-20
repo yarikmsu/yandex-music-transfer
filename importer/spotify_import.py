@@ -20,6 +20,7 @@ import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import NamedTuple
 
@@ -89,6 +90,17 @@ SEARCH_CHUNK = "xpui-routes-search"
 class LoginRefused(ApiError):
     def __init__(self):
         super().__init__(LOGIN_REFUSED)
+
+
+class SameHostRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib copies every header onto a redirect, the cookie and the token too, so only
+    redirects that stay on the same HTTPS host are followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if new.scheme != "https" or new.hostname != old.hostname:
+            raise urllib.error.HTTPError(req.full_url, code, "redirect to another host refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class Player(NamedTuple):
@@ -511,6 +523,7 @@ def cmd_import(client: SpotifyClient | None, apply: bool) -> None:
 
 
 def main(argv: list[str]) -> int:
+    urllib.request.install_opener(urllib.request.build_opener(SameHostRedirects))
     command = argv[1] if len(argv) > 1 else ""
     if command not in ("check", "match", "import"):
         print(__doc__)
