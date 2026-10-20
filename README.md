@@ -1,9 +1,9 @@
-# Yandex Music to Apple Music, YouTube Music and Amazon Music
+# Yandex Music to Apple Music, YouTube Music, Amazon Music and Spotify
 
-Moves a Yandex Music library to Apple Music, YouTube Music, Amazon Music, or any of
-them. It exports your liked tracks and playlists to CSV, finds each track in the other
+Moves a Yandex Music library to Apple Music, YouTube Music, Amazon Music, Spotify,
+or any of them. It exports your liked tracks and playlists to CSV, finds each track in the other
 service's catalog, and adds the matches to your Apple Music Favorites, your YouTube
-Music Liked music or your Amazon Music Liked Songs. The Apple importer can also
+Music Liked music, your Amazon Music Liked Songs or your Spotify Liked Songs. The Apple importer can also
 recreate the playlists.
 
 Every step runs on your machine in a locked-down Docker container, using only the
@@ -13,10 +13,10 @@ Python standard library.
 
 - Docker
 - A Yandex Music account
-- An Apple Music subscription, a YouTube Music account (the free tier is enough), or
-  an Amazon Music account
+- An Apple Music subscription, a YouTube Music account (the free tier is enough), an
+  Amazon Music account, or a Spotify account (free or Premium)
 - Chrome or another browser with developer tools, to copy the Apple Music tokens, the
-  YouTube Music cookie or the Amazon Music cookie
+  YouTube Music cookie, the Amazon Music cookie or the Spotify cookie
 
 ## 1. Export from Yandex Music
 
@@ -104,6 +104,27 @@ hand in `out/apple/matches.csv` are looked for on Amazon too.
    first, as for YouTube.
 3. Put `paste_here` back into `run/.amazon.env` and sign out of music.amazon.com.
 
+## 5. Import into Spotify
+
+This works with or without the other imports; the songs you picked by hand in
+`out/apple/matches.csv` are looked for on Spotify too.
+
+1. `cp run/spotify.env.example run/.spotify.env` and paste the `sp_dc` cookie of a
+   signed-in open.spotify.com session into it; [importer/SPOTIFY.md](importer/SPOTIFY.md)
+   shows where to find it.
+2. Run:
+
+   ```
+   bash run/spotify.sh check            # cookie works? shows the account
+   bash run/spotify.sh match            # writes out/spotify/matches.csv
+   bash run/spotify.sh import           # dry run
+   bash run/spotify.sh import --apply   # like the matched songs
+   ```
+
+   Review `out/spotify/matches.csv` before importing; every `check` row needs a decision
+   first, as for YouTube.
+3. Put `paste_here` back into `run/.spotify.env` and sign out of open.spotify.com.
+
 ## Safety
 
 - The container has a read-only file system, no Linux capabilities and no
@@ -111,7 +132,8 @@ hand in `out/apple/matches.csv` are looked for on Amazon too.
   and `out/`.
 - `run/run.sh` refuses to run if the exporter differs from the reviewed version.
 - Tokens arrive through env files, never on the command line. `run/.env`,
-  `run/.apple.env`, `run/.ytmusic.env`, `run/.amazon.env` and `out/` (your library)
+  `run/.apple.env`, `run/.ytmusic.env`, `run/.amazon.env`, `run/.spotify.env` and `out/`
+  (your library)
   are git-ignored.
 - The Apple Music tokens are sent only to Apple Music. Catalog searches go to the
   public iTunes Search API with no tokens at all.
@@ -121,6 +143,9 @@ hand in `out/apple/matches.csv` are looked for on Amazon too.
 - The Amazon Music cookie is your amazon.com login, shopping included. Only its session
   cookies are kept, and they are sent only to music.amazon.com and gql.music.amazon.com.
   This importer, too, only ever likes songs.
+- The Spotify cookie is your Spotify login. It is sent only to open.spotify.com, for the
+  web player's short-lived token, which goes only to Spotify's player API. This importer
+  only ever likes songs as well.
 - None of these services officially supports access this way, so any of them may
   block it at any time.
 
