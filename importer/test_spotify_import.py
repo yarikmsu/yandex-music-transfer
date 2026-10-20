@@ -145,7 +145,7 @@ class TokenTest(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=[http_ok({"serverTime": NOW}), refused(400)]):
             with self.assertRaises(sp.ApiError) as raised:
                 sp.fetch_token("SPDC", PLAYER)
-        self.assertNotIsInstance(raised.exception, sp.LoginRefused)
+        self.assertIsInstance(raised.exception, sp.PlayerChanged)
         self.assertIn(sp.PLAYER_CHANGED, str(raised.exception))
 
     def test_cookie_never_appears_in_errors(self, _time, _sleep):
@@ -353,7 +353,7 @@ class ClientTest(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", return_value=reply):
             with self.assertRaises(sp.ApiError) as raised:
                 client.graphql("searchTracks", {})
-        self.assertNotIsInstance(raised.exception, sp.LoginRefused)
+        self.assertIsInstance(raised.exception, sp.PlayerChanged)
         self.assertIn(sp.PLAYER_CHANGED, str(raised.exception))
 
     @mock.patch.object(sp.time, "time", return_value=NOW)
@@ -446,6 +446,13 @@ class MatchCommandTest(InTempDir):
     @mock.patch("builtins.print")
     def test_refused_login_while_searching_keeps_its_advice(self, _print):
         self.assertEqual(self.failing_search(sp.LoginRefused()), sp.LOGIN_REFUSED)
+
+    @mock.patch("builtins.print")
+    def test_changed_player_while_searching_does_not_suggest_skipping(self, _print):
+        # Skipping would mark a good track missing when a rerun alone fixes it
+        message = self.failing_search(sp.PlayerChanged("searchTracks"))
+        self.assertIn(sp.PLAYER_CHANGED, message)
+        self.assertNotIn("missing", message)
 
 
 def match(track_id, status, spotify_id=""):

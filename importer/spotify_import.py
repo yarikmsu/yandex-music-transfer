@@ -92,6 +92,13 @@ class LoginRefused(ApiError):
         super().__init__(LOGIN_REFUSED)
 
 
+class PlayerChanged(ApiError):
+    """Spotify no longer answers what the player's code says; a rerun reads it afresh."""
+
+    def __init__(self, what: str):
+        super().__init__(f"{what}; {PLAYER_CHANGED}")
+
+
 class SameHostRedirects(urllib.request.HTTPRedirectHandler):
     """urllib copies every header onto a redirect, the cookie and the token too, so only
     redirects that stay on the same HTTPS host are followed."""
@@ -167,7 +174,7 @@ def fetch_text(url: str) -> str:
 def load_player() -> Player:
     url = bundle_url(fetch_text(OPEN + "/"))
     if not url:
-        raise ApiError(f"open.spotify.com links no web player code; {PLAYER_CHANGED}")
+        raise PlayerChanged("open.spotify.com links no web player code")
     js = fetch_text(url)
     secrets = parse_secrets(js)
     hashes = parse_operations(js)
@@ -176,7 +183,7 @@ def load_player() -> Player:
         hashes.update(parse_operations(fetch_text(chunk)))
     missing = ([] if secrets else ["login secret"]) + [name for name in OPERATIONS if name not in hashes]
     if missing:
-        raise ApiError(f"no {', '.join(missing)} in the web player code; {PLAYER_CHANGED}")
+        raise PlayerChanged(f"no {', '.join(missing)} in the web player code")
     secret, version = secrets[0]
     return Player(secret, version, {name: hashes[name] for name in OPERATIONS})
 
@@ -208,7 +215,7 @@ def fetch_token(sp_dc: str, player: Player) -> tuple[str, float]:
             raise LoginRefused() from None
         if e.status == 400:
             # What a code built from an outdated secret gets
-            raise ApiError(f"open.spotify.com refused the login code; {PLAYER_CHANGED}", 400) from None
+            raise PlayerChanged("open.spotify.com refused the login code") from None
         raise
     if answer.get("isAnonymous") is not False or not answer.get("accessToken"):
         raise LoginRefused()
@@ -252,7 +259,7 @@ class SpotifyClient(JsonClient):
                 raise
         errors = answer.get("errors") or []
         if "PersistedQueryNotFound" in json.dumps(errors):
-            raise ApiError(f"{operation}: {PLAYER_CHANGED}")
+            raise PlayerChanged(f"Spotify no longer knows the {operation} request")
         if errors:
             messages = (str(error.get("message", error)) if isinstance(error, dict) else str(error)
                         for error in errors)
@@ -412,7 +419,7 @@ def search_tracks(client: SpotifyClient, tracks: dict, apple: dict, done: dict) 
         for i, (track_id, track) in enumerate(todo, 1):
             try:
                 best = find_match(client, reference(track, apple.get(track_id)))
-            except LoginRefused:
+            except (LoginRefused, PlayerChanged):
                 raise
             except ApiError as e:
                 # A rerun stops at the same track, so say which one and how to get past it
@@ -455,7 +462,7 @@ def like_songs(client: SpotifyClient, state: dict, songs: list[str]) -> None:
     for i, song in enumerate(pending, 1):
         try:
             answer = client.graphql("addToLibrary", {"libraryItemUris": [TRACK_URI + song], "interactionId": None})
-        except LoginRefused:
+        except (LoginRefused, PlayerChanged):
             raise
         except ApiError as e:
             raise ApiError(f"liking {OPEN}/track/{song} failed: {e}; stopped so a rerun keeps the order",
