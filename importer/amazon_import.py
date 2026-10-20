@@ -10,14 +10,16 @@ Every command but the dry run reads the login from AMAZON_MUSIC_AUTH: the author
 header of a request the signed-in music.amazon.com player sends to gql.music.amazon.dev.
 """
 import base64
+import csv
 import json
 import os
 import sys
 import time
-import urllib.request
 
-from apple_import import ApiError, JsonClient
-from ytmusic_import import dig
+from apple_import import (
+    ApiError, JsonClient, format_duration, load_tracks, print_status_summary, progress, read_csv,
+)
+from ytmusic_import import best_of, dig, load_apple_matches, reference
 
 # Amazon's documented Music API is a closed beta; these are the calls its own web
 # player makes, as used by SongMirror (github.com/ahnafnafee/songmirror)
@@ -36,6 +38,13 @@ LOGIN_EXPIRED = ("Amazon Music refused the login; it lasts about an hour. Copy a
 # Seconds between requests; likes go slower, as they change the account
 SEARCH_PAUSE = 1.0
 LIKE_PAUSE = 2.0
+
+AMAZON_DIR = "amazon"
+MATCHES_PATH = os.path.join(AMAZON_DIR, "matches.csv")
+MATCH_FIELDS = [
+    "yandex_id", "title", "artist", "album", "duration", "status", "asin",
+    "amazon_title", "amazon_artist", "amazon_album", "amazon_duration", "score",
+]
 
 SEARCH_QUERY = """
 query SearchTracks($query: String!) {
@@ -115,6 +124,86 @@ def parse_search(data: dict) -> list[dict]:
 
 def search(client: AmazonMusicClient, query: str) -> list[dict]:
     return parse_search(client.graphql(SEARCH_QUERY, {"query": query}))
+
+
+# --- Matching (the rules are YouTube Music's: ytmusic_import.best_of) ---
+
+def find_match(client: AmazonMusicClient, reference: dict) -> tuple[dict, dict, str] | None:
+    """Songs by title and artist, then by title alone; stops at a match."""
+    with_artist = f"{reference['title']} {reference['artist'].split(', ')[0]}"
+    candidates, best = [], None
+    for query in (with_artist, reference["title"]):
+        candidates += search(client, query)
+        best = best_of(reference, candidates)
+        if best and best[2] == "matched":
+            break
+    return best
+
+
+def match_row(track_id: str, track: dict, best) -> dict:
+    row = dict.fromkeys(MATCH_FIELDS, "")
+    row.update(yandex_id=track_id, status="missing", **track)
+    if best is None:
+        return row
+    song, scores, status = best
+    attrs = song["attributes"]
+    row.update(
+        status=status,
+        asin=song["id"],
+        amazon_title=attrs["name"],
+        amazon_artist=attrs["artistName"],
+        amazon_album=attrs["albumName"],
+        amazon_duration=format_duration(attrs["durationInMillis"]),
+        score=f"{scores['total']:.2f}",
+    )
+    return row
+
+
+# --- Local files ---
+
+def load_matches() -> dict[str, dict]:
+    if not os.path.exists(MATCHES_PATH):
+        return {}
+    return {row["yandex_id"]: row for row in read_csv(MATCHES_PATH)}
+
+
+def write_matches(rows: dict[str, dict]) -> None:
+    tmp_path = MATCHES_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MATCH_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows.values())
+    os.replace(tmp_path, MATCHES_PATH)
+
+
+# --- Commands ---
+
+def cmd_match(client: AmazonMusicClient) -> None:
+    tracks = load_tracks()
+    done = load_matches()
+    search_tracks(client, tracks, load_apple_matches(), done)
+    print_status_summary(done.values())
+
+
+def search_tracks(client: AmazonMusicClient, tracks: dict, apple: dict, done: dict) -> None:
+    """Search every track not yet in matches.csv, adding rows to it and to done."""
+    todo = [(track_id, track) for track_id, track in tracks.items() if track_id not in done]
+    print(f"{len(tracks)} tracks, {len(todo)} left to search")
+    os.makedirs(AMAZON_DIR, exist_ok=True)
+    write_header = not os.path.exists(MATCHES_PATH)
+    started = time.monotonic()
+    # Appending row by row means an interrupted run, or an expired login, resumes where it stopped
+    with open(MATCHES_PATH, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MATCH_FIELDS)
+        if write_header:
+            writer.writeheader()
+        for i, (track_id, track) in enumerate(todo, 1):
+            best = find_match(client, reference(track, apple.get(track_id)))
+            done[track_id] = match_row(track_id, track, best)
+            writer.writerow(done[track_id])
+            f.flush()
+            if i % 25 == 0 or i == len(todo):
+                print(progress(i, len(todo), started, "searched"))
 
 
 # --- Login ---

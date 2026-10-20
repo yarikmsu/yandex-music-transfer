@@ -1,13 +1,18 @@
 import base64
+import csv
 import io
 import json
 import os
+import tempfile
 import unittest
 import urllib.error
 from unittest import mock
 
 import amazon_import as am
 
+OK_HEADER = ["#", "Title", "Artist", "Album", "Year", "Duration", "ID", "Availability"]
+APPLE_HEADER = ["yandex_id", "title", "artist", "album", "duration", "status",
+                "apple_id", "apple_title", "apple_artist", "apple_album", "apple_duration", "score"]
 CONTEXT = {"deviceId": "14534074384711863", "deviceType": "A16ZV8BU3SN1N3", "access_token": "Atna|secret"}
 
 
@@ -39,6 +44,42 @@ def http_ok(payload):
     return ok
 
 
+def track(title, artist, duration="3:31", album=""):
+    return {"title": title, "artist": artist, "album": album, "duration": duration}
+
+
+def write_csv(path, header, rows):
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+class FakeAmazon:
+    """Answers searches from `answers`, keyed by query text, and records every call."""
+
+    def __init__(self, answers=None):
+        self.answers = answers or {}
+        self.calls = []
+
+    def graphql(self, query, variables):
+        self.calls.append((query, variables))
+        if query == am.SEARCH_QUERY:
+            return search_data(*self.answers.get(variables["query"], []))
+        return {}
+
+    def queries(self):
+        return [variables["query"] for query, variables in self.calls if query == am.SEARCH_QUERY]
+
+
+class InTempDir(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(tmp.name)
+
+
 class SearchParsingTest(unittest.TestCase):
     def test_track_becomes_a_catalog_song(self):
         found = am.parse_search(search_data(node("B07ABCDEF1", "Линия жизни", ["Сплин"], 183, "25 кадр")))
@@ -65,7 +106,7 @@ class ClientTest(unittest.TestCase):
     def test_search_sends_the_login_only_to_amazon_music(self, sleep):
         client = am.AmazonMusicClient(auth_value())
         reply = http_ok({"data": search_data(node("B1", "Линия жизни", ["Сплин"], 183))})
-        with mock.patch.object(am.urllib.request, "urlopen", return_value=reply) as urlopen:
+        with mock.patch("urllib.request.urlopen", return_value=reply) as urlopen:
             found = am.search(client, "Линия жизни Сплин")
         self.assertEqual([song["id"] for song in found], ["B1"])
         sent = urlopen.call_args.args[0]
@@ -82,7 +123,7 @@ class ClientTest(unittest.TestCase):
     def test_graphql_error_raises(self, _sleep):
         client = am.AmazonMusicClient(auth_value())
         reply = http_ok({"data": None, "errors": [{"message": "Bad field", "extensions": {"code": "BAD"}}]})
-        with mock.patch.object(am.urllib.request, "urlopen", return_value=reply):
+        with mock.patch("urllib.request.urlopen", return_value=reply):
             with self.assertRaises(am.ApiError) as raised:
                 client.graphql(am.SEARCH_QUERY, {"query": "x"})
         self.assertIn("Bad field", str(raised.exception))
@@ -91,7 +132,7 @@ class ClientTest(unittest.TestCase):
     def test_auth_error_says_to_copy_a_fresh_login(self, _sleep):
         client = am.AmazonMusicClient(auth_value())
         reply = http_ok({"data": None, "errors": [{"message": "x", "extensions": {"code": "AUTH_TOKEN_EXPIRED"}}]})
-        with mock.patch.object(am.urllib.request, "urlopen", return_value=reply):
+        with mock.patch("urllib.request.urlopen", return_value=reply):
             with self.assertRaises(am.ApiError) as raised:
                 client.graphql(am.SEARCH_QUERY, {"query": "x"})
         self.assertEqual(str(raised.exception), am.LOGIN_EXPIRED)
@@ -100,10 +141,64 @@ class ClientTest(unittest.TestCase):
     def test_refused_request_says_to_copy_a_fresh_login(self, _sleep):
         client = am.AmazonMusicClient(auth_value())
         refused = urllib.error.HTTPError("url", 401, "Unauthorized", {}, io.BytesIO(b'{"errors": []}'))
-        with mock.patch.object(am.urllib.request, "urlopen", side_effect=[refused]):
+        with mock.patch("urllib.request.urlopen", side_effect=[refused]):
             with self.assertRaises(am.ApiError) as raised:
                 client.graphql(am.SEARCH_QUERY, {"query": "x"})
         self.assertEqual(str(raised.exception), am.LOGIN_EXPIRED)
+
+
+class MatchTest(unittest.TestCase):
+    def test_same_song_is_matched_from_the_first_search(self):
+        fake = FakeAmazon({"Линия жизни Сплин": [node("B1", "Линия жизни", ["Сплин"], 183)]})
+        song, _, status = am.find_match(fake, track("Линия жизни", "Сплин", "3:02"))
+        self.assertEqual((song["id"], status), ("B1", "matched"))
+        self.assertEqual(fake.queries(), ["Линия жизни Сплин"])
+
+    def test_title_alone_finds_an_artist_spelled_otherwise(self):
+        fake = FakeAmazon({"Линия жизни": [node("B2", "Линия жизни", ["Splean"], 183)]})
+        song, _, status = am.find_match(fake, track("Линия жизни", "Сплин", "3:03"))
+        self.assertEqual((song["id"], status), ("B2", "matched"))
+        self.assertEqual(fake.queries(), ["Линия жизни Сплин", "Линия жизни"])
+
+    def test_karaoke_copy_is_only_check(self):
+        fake = FakeAmazon({"San Francisco Scott McKenzie": [
+            node("B3", "San Francisco", ["Scott McKenzie (Karaoke)"], 174, "Zoom Karaoke")]})
+        _, _, status = am.find_match(fake, track("San Francisco", "Scott McKenzie", "2:53"))
+        self.assertEqual(status, "check")
+
+    def test_match_row_names_the_amazon_song(self):
+        exported = track("Линия жизни", "Сплин", "3:02")
+        best = am.find_match(FakeAmazon({"Линия жизни Сплин": [
+            node("B1", "Линия жизни", ["Сплин"], 183, "25 кадр")]}), exported)
+        row = am.match_row("10", exported, best)
+        self.assertEqual((row["yandex_id"], row["status"], row["asin"], row["amazon_album"], row["amazon_duration"]),
+                         ("10", "matched", "B1", "25 кадр", "3:03"))
+
+    def test_nothing_found_is_missing(self):
+        exported = track("Unknown", "Nobody")
+        row = am.match_row("10", exported, am.find_match(FakeAmazon(), exported))
+        self.assertEqual((row["status"], row["asin"], row["title"]), ("missing", "", "Unknown"))
+
+
+class MatchCommandTest(InTempDir):
+    @mock.patch("builtins.print")
+    def test_match_resumes_and_searches_the_reviewed_apple_names(self, _print):
+        write_csv("liked_tracks_me.csv", OK_HEADER, [
+            ["1", "Done", "A", "", "", "3:00", "10", "OK"],
+            ["2", "Shoot To Thrill (Made Famous By AC/DC)", "Iron Man", "", "", "5:20", "11", "OK"],
+        ])
+        os.makedirs("apple")
+        write_csv("apple/matches.csv", APPLE_HEADER, [
+            ["11", "", "", "", "", "matched", "1", "Shoot to Thrill", "AC/DC", "Back in Black", "5:17", "1"]])
+        os.makedirs(am.AMAZON_DIR)
+        am.write_matches({"10": {**dict.fromkeys(am.MATCH_FIELDS, ""), "yandex_id": "10", "status": "skip"}})
+        fake = FakeAmazon({"Shoot to Thrill AC/DC": [node("B11", "Shoot to Thrill", ["AC/DC"], 317)]})
+        am.cmd_match(fake)
+        self.assertEqual(fake.queries(), ["Shoot to Thrill AC/DC"])
+        rows = am.load_matches()
+        self.assertEqual(list(rows), ["10", "11"])
+        self.assertEqual((rows["10"]["status"], rows["11"]["asin"]), ("skip", "B11"))
+        self.assertEqual(rows["11"]["title"], "Shoot To Thrill (Made Famous By AC/DC)")
 
 
 class LoginTest(unittest.TestCase):
