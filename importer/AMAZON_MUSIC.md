@@ -47,9 +47,10 @@ Each exported track is searched by title with its first artist, then by title al
 whatever the length, karaoke and tribute copies are at most `check`, and where your
 reviewed Apple matches in `out/apple/matches.csv` name another artist or title, Amazon is
 searched for that Apple song instead. Amazon often has live and remixed versions of a
-song too; one whose title says Live, Mix, Remix, Demo, Acoustic, Instrumental or
-Unplugged, while your track's does not (or the other way round), is chosen only when
-nothing else matches. Remastered versions count as the same recording.
+song too; one whose title notes, in brackets or after a dash, say Live, Mix, Remix, Demo,
+Acoustic, Instrumental or Unplugged, while your track's do not (or the other way round),
+is chosen only when nothing else matches. Such a word in the song's own name, as in
+"Live Forever", is no note. Remastered versions count as the same recording.
 
 The `status` in `matches.csv` is `matched` (will be liked), `check` (a likely candidate
 that needs your decision) or `missing` (nothing close). To hear a candidate, open

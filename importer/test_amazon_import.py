@@ -63,6 +63,13 @@ def write_csv(path, header, rows):
         writer.writerows(rows)
 
 
+def write_matches(rows):
+    with open(am.MATCHES_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=am.MATCH_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows.values())
+
+
 def filters_of(variables):
     """(title, artist or None) of a search request."""
     filters = variables["options"]["searchFilters"]
@@ -260,6 +267,20 @@ class MatchTest(unittest.TestCase):
         song, _, _ = am.find_match(fake, track("In the End (Live)", "Linkin Park", "3:36"))
         self.assertEqual(song["id"], "B1")
 
+    def test_live_in_the_song_name_is_not_a_version_note(self):
+        live = node("B1", "Live Forever (Live at Knebworth)", ["Oasis"], 277)
+        album = node("B2", "Live Forever (Remastered)", ["Oasis"], 284)
+        fake = FakeAmazon({("Live Forever", "Oasis"): [live, album]})
+        song, _, _ = am.find_match(fake, track("Live Forever", "Oasis", "4:36"))
+        self.assertEqual(song["id"], "B2")
+
+    def test_version_note_after_a_dash_counts(self):
+        live = node("B1", "In the End - Live in Texas", ["Linkin Park"], 211)
+        album = node("B2", "In the End", ["Linkin Park"], 216)
+        fake = FakeAmazon({("In the End", "Linkin Park"): [live, album]})
+        song, _, _ = am.find_match(fake, track("In the End", "Linkin Park", "3:31"))
+        self.assertEqual(song["id"], "B2")
+
     def test_karaoke_copy_is_only_check(self):
         fake = FakeAmazon({("San Francisco", "Scott McKenzie"): [
             node("B3", "San Francisco", ["Scott McKenzie (Karaoke)"], 174, "Zoom Karaoke")]})
@@ -291,7 +312,7 @@ class MatchCommandTest(InTempDir):
         write_csv("apple/matches.csv", APPLE_HEADER, [
             ["11", "", "", "", "", "matched", "1", "Shoot to Thrill", "AC/DC", "Back in Black", "5:17", "1"]])
         os.makedirs(am.AMAZON_DIR)
-        am.write_matches({"10": {**dict.fromkeys(am.MATCH_FIELDS, ""), "yandex_id": "10", "status": "skip"}})
+        write_matches({"10": {**dict.fromkeys(am.MATCH_FIELDS, ""), "yandex_id": "10", "status": "skip"}})
         fake = FakeAmazon({("Shoot to Thrill", "AC/DC"): [node("B11", "Shoot to Thrill", ["AC/DC"], 317)]})
         am.cmd_match(fake)
         self.assertEqual(fake.queries(), [("Shoot to Thrill", "AC/DC")])
@@ -317,11 +338,11 @@ class ImportTest(InTempDir):
         os.makedirs(am.AMAZON_DIR)
         self.rows = {"10": match("10", "matched", asin(10)), "11": match("11", "matched", asin(11)),
                      "12": match("12", "matched", asin(12)), "13": match("13", "missing")}
-        am.write_matches(self.rows)
+        write_matches(self.rows)
         self.fake = FakeAmazon()
 
     def assert_refused(self):
-        am.write_matches(self.rows)
+        write_matches(self.rows)
         with self.assertRaises(SystemExit):
             am.cmd_import(self.fake, apply=True)
         self.assertEqual(self.fake.calls, [])

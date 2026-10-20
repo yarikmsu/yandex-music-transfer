@@ -18,8 +18,8 @@ import sys
 import time
 
 from apple_import import (
-    STATUS_RANK, ApiError, JsonClient, format_duration, load_collections, load_tracks,
-    print_status_summary, progress, read_csv, score_candidate,
+    BRACKETS, DASH_SUFFIX, STATUS_RANK, ApiError, JsonClient, format_duration, load_collections,
+    load_tracks, print_status_summary, progress, read_csv, score_candidate,
 )
 from ytmusic_import import dig, like_order, load_apple_matches, reference, status_of
 
@@ -202,8 +202,17 @@ def load_login() -> str:
 def other_recording(song: dict, reference: dict) -> bool:
     """Whether a live, remix or other version note sets the song apart from the exported track."""
     def notes(title: str) -> set[str]:
-        return {note.lower() for note in RECORDING_NOTE.findall(title)}
+        # Only the notes in brackets or after a dash: "Live Forever" is a name, not a live recording
+        extras = " ".join(BRACKETS.findall(title) + DASH_SUFFIX.findall(title))
+        return {note.lower() for note in RECORDING_NOTE.findall(extras)}
     return notes(song["attributes"]["name"]) != notes(reference["title"])
+
+
+def rank(reference: dict, best: tuple[dict, dict, str]) -> tuple:
+    song, scores, status = best
+    # Amazon often carries live and remixed versions of a length closer to the export's
+    # than the album recording, so the same recording counts before the length does
+    return STATUS_RANK[status], not other_recording(song, reference), scores["total"]
 
 
 def best_of(reference: dict, candidates: list[dict]) -> tuple[dict, dict, str] | None:
@@ -211,20 +220,19 @@ def best_of(reference: dict, candidates: list[dict]) -> tuple[dict, dict, str] |
     for song in candidates:
         scores = score_candidate(reference, song)
         scored.append((song, scores, status_of(scores, song, reference)))
-    # Amazon often carries live and remixed versions of a length closer to the export's
-    # than the album recording, so the same recording counts before the length does
-    return max(scored, key=lambda b: (STATUS_RANK[b[2]], not other_recording(b[0], reference),
-                                      b[1]["total"]), default=None)
+    return max(scored, key=lambda b: rank(reference, b), default=None)
 
 
 def find_match(client: AmazonMusicClient, reference: dict) -> tuple[dict, dict, str] | None:
     """Songs by title and first artist, then by title alone, which finds artists Amazon
     spells otherwise; stops at a match of the same recording."""
     first_artist = reference["artist"].split(", ")[0]
-    candidates, best = [], None
+    best = None
     for artist in ([first_artist] if first_artist else []) + [None]:
-        candidates += search(client, reference["title"], artist)
-        best = best_of(reference, candidates)
+        found = best_of(reference, search(client, reference["title"], artist))
+        # On a tie the first search's song stays, as it names the artist too
+        if found and (best is None or rank(reference, found) > rank(reference, best)):
+            best = found
         if best and best[2] == "matched" and not other_recording(best[0], reference):
             break
     return best
@@ -255,15 +263,6 @@ def load_matches() -> dict[str, dict]:
     if not os.path.exists(MATCHES_PATH):
         return {}
     return {row["yandex_id"]: row for row in read_csv(MATCHES_PATH)}
-
-
-def write_matches(rows: dict[str, dict]) -> None:
-    tmp_path = MATCHES_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=MATCH_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows.values())
-    os.replace(tmp_path, MATCHES_PATH)
 
 
 def write_not_imported(matches: dict, asins: dict, liked: list[str], playlists: list) -> None:
