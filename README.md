@@ -1,9 +1,10 @@
-# Yandex Music to Apple Music and YouTube Music
+# Yandex Music to Apple Music, YouTube Music and Amazon Music
 
-Moves a Yandex Music library to Apple Music, YouTube Music, or both. It exports your
-liked tracks and playlists to CSV, finds each track in the other service's catalog,
-and adds the matches to your Apple Music Favorites or your YouTube Music Liked music.
-The Apple importer can also recreate the playlists.
+Moves a Yandex Music library to Apple Music, YouTube Music, Amazon Music, or any of
+them. It exports your liked tracks and playlists to CSV, finds each track in the other
+service's catalog, and adds the matches to your Apple Music Favorites, your YouTube
+Music Liked music or your Amazon Music Liked Songs. The Apple importer can also
+recreate the playlists.
 
 Every step runs on your machine in a locked-down Docker container, using only the
 Python standard library.
@@ -12,9 +13,10 @@ Python standard library.
 
 - Docker
 - A Yandex Music account
-- An Apple Music subscription, or a YouTube Music account (the free tier is enough)
-- Chrome or another browser with developer tools, to copy the Apple Music tokens or
-  the YouTube Music cookie
+- An Apple Music subscription, a YouTube Music account (the free tier is enough), or
+  an Amazon Music account
+- Chrome or another browser with developer tools, to copy the Apple Music tokens, the
+  YouTube Music cookie or the Amazon Music authorization value
 
 ## 1. Export from Yandex Music
 
@@ -81,19 +83,45 @@ are looked for on YouTube too.
 
 3. Put `paste_here` back into `run/.ytmusic.env` and sign out of music.youtube.com.
 
+## 4. Import into Amazon Music
+
+This works with or without the other imports; as for YouTube, the songs you picked by
+hand in `out/apple/matches.csv` are looked for on Amazon too.
+
+1. `cp run/amazon.env.example run/.amazon.env` and paste the authorization value of a
+   signed-in music.amazon.com session into it; [importer/AMAZON_MUSIC.md](importer/AMAZON_MUSIC.md)
+   shows where to find it. It expires after about an hour: when a command says so, paste
+   a fresh one and run the same command again.
+2. Run:
+
+   ```
+   bash run/amazon.sh check            # login works? shows the account ID
+   bash run/amazon.sh match            # writes out/amazon/matches.csv
+   bash run/amazon.sh import           # dry run
+   bash run/amazon.sh import --apply   # like the matched songs
+   ```
+
+   Review `out/amazon/matches.csv` before importing; every `check` row needs a decision
+   first, as for YouTube.
+3. Put `paste_here` back into `run/.amazon.env` and sign out of music.amazon.com.
+
 ## Safety
 
 - The container has a read-only file system, no Linux capabilities and no
-  privilege escalation. It runs as your user and sees only the script (read-only)
+  privilege escalation. It runs as your user and sees only the scripts (read-only)
   and `out/`.
 - `run/run.sh` refuses to run if the exporter differs from the reviewed version.
 - Tokens arrive through env files, never on the command line. `run/.env`,
-  `run/.apple.env`, `run/.ytmusic.env` and `out/` (your library) are git-ignored.
+  `run/.apple.env`, `run/.ytmusic.env`, `run/.amazon.env` and `out/` (your library)
+  are git-ignored.
 - The Apple Music tokens are sent only to Apple Music. Catalog searches go to the
   public iTunes Search API with no tokens at all.
 - The YouTube Music cookie is a full Google login. It reaches the container only for
   `check` and `import --apply` and is sent only to music.youtube.com; searches go
   without it. The importer only ever likes songs: it never unlikes or removes anything.
+- The Amazon Music authorization value is the web player's own access token, which
+  expires after about an hour; no amazon.com cookie is ever needed. It is sent only to
+  gql.music.amazon.dev, and the importer, too, only ever likes songs.
 - None of these services officially supports access this way, so any of them may
   block it at any time.
 
