@@ -18,10 +18,10 @@ import sys
 import time
 
 from apple_import import (
-    ApiError, JsonClient, format_duration, load_collections, load_tracks, print_status_summary,
-    progress, read_csv,
+    STATUS_RANK, ApiError, JsonClient, format_duration, load_collections, load_tracks,
+    print_status_summary, progress, read_csv, score_candidate,
 )
-from ytmusic_import import best_of, dig, like_order, load_apple_matches, reference
+from ytmusic_import import dig, like_order, load_apple_matches, reference, status_of
 
 # Amazon's documented Music API is a closed beta; these are the calls its own web
 # player makes (see also SongMirror, github.com/ahnafnafee/songmirror)
@@ -60,6 +60,8 @@ NOT_IMPORTED_FIELDS = [
 ]
 STATUSES = ("matched", "check", "missing", "skip")
 ASIN = re.compile(r"[A-Z0-9]{10}")
+# Notes that name another recording of the song; "Remastered" and the like do not
+RECORDING_NOTE = re.compile(r"\b(live|remix|mix|demo|acoustic|instrumental|unplugged)\b", re.IGNORECASE)
 
 # A "name" filter matches words of the track title only; an artist filter narrows that down
 SEARCH_QUERY = """
@@ -195,17 +197,35 @@ def load_login() -> str:
     return "; ".join(f"{name}={value}" for name, value in values.items())
 
 
-# --- Matching (the rules are YouTube Music's: ytmusic_import.best_of) ---
+# --- Matching (the statuses are YouTube Music's: ytmusic_import.status_of) ---
+
+def other_recording(song: dict, reference: dict) -> bool:
+    """Whether a live, remix or other version note sets the song apart from the exported track."""
+    def notes(title: str) -> set[str]:
+        return {note.lower() for note in RECORDING_NOTE.findall(title)}
+    return notes(song["attributes"]["name"]) != notes(reference["title"])
+
+
+def best_of(reference: dict, candidates: list[dict]) -> tuple[dict, dict, str] | None:
+    scored = []
+    for song in candidates:
+        scores = score_candidate(reference, song)
+        scored.append((song, scores, status_of(scores, song, reference)))
+    # Amazon often carries live and remixed versions of a length closer to the export's
+    # than the album recording, so the same recording counts before the length does
+    return max(scored, key=lambda b: (STATUS_RANK[b[2]], not other_recording(b[0], reference),
+                                      b[1]["total"]), default=None)
+
 
 def find_match(client: AmazonMusicClient, reference: dict) -> tuple[dict, dict, str] | None:
     """Songs by title and first artist, then by title alone, which finds artists Amazon
-    spells otherwise; stops at a match."""
+    spells otherwise; stops at a match of the same recording."""
     first_artist = reference["artist"].split(", ")[0]
     candidates, best = [], None
     for artist in ([first_artist] if first_artist else []) + [None]:
         candidates += search(client, reference["title"], artist)
         best = best_of(reference, candidates)
-        if best and best[2] == "matched":
+        if best and best[2] == "matched" and not other_recording(best[0], reference):
             break
     return best
 

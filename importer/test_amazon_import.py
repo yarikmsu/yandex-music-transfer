@@ -233,6 +233,33 @@ class MatchTest(unittest.TestCase):
         am.find_match(fake, track("Numb / Encore", "Linkin Park, JAY-Z"))
         self.assertEqual(fake.queries()[0], ("Numb / Encore", "Linkin Park"))
 
+    def test_album_recording_beats_a_live_one_of_closer_length(self):
+        live = node("B1", "In the End (Live)", ["Linkin Park"], 211)
+        album = node("B2", "In the End", ["Linkin Park"], 216)
+        fake = FakeAmazon({("In the End", "Linkin Park"): [live, album]})
+        song, _, status = am.find_match(fake, track("In the End", "Linkin Park", "3:31"))
+        self.assertEqual((song["id"], status), ("B2", "matched"))
+
+    def test_title_alone_is_searched_when_only_another_recording_matched(self):
+        fake = FakeAmazon({
+            ("Touch Me", "The Doors"): [node("B1", "Touch Me (Doors Only Mix)", ["The Doors"], 193)],
+            ("Touch Me", None): [node("B2", "Touch Me", ["The Doors"], 195)],
+        })
+        song, _, _ = am.find_match(fake, track("Touch Me", "The Doors", "3:12"))
+        self.assertEqual(song["id"], "B2")
+
+    def test_live_recording_is_still_matched_when_it_is_all_there_is(self):
+        fake = FakeAmazon({("In the End", "Linkin Park"): [node("B1", "In the End (Live)", ["Linkin Park"], 211)]})
+        song, _, status = am.find_match(fake, track("In the End", "Linkin Park", "3:31"))
+        self.assertEqual((song["id"], status), ("B1", "matched"))
+
+    def test_exported_live_track_prefers_the_live_recording(self):
+        live = node("B1", "In the End (Live)", ["Linkin Park"], 216)
+        album = node("B2", "In the End", ["Linkin Park"], 216)
+        fake = FakeAmazon({("In the End (Live)", "Linkin Park"): [album, live]})
+        song, _, _ = am.find_match(fake, track("In the End (Live)", "Linkin Park", "3:36"))
+        self.assertEqual(song["id"], "B1")
+
     def test_karaoke_copy_is_only_check(self):
         fake = FakeAmazon({("San Francisco", "Scott McKenzie"): [
             node("B3", "San Francisco", ["Scott McKenzie (Karaoke)"], 174, "Zoom Karaoke")]})
