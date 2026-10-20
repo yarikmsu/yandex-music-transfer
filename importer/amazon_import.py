@@ -47,6 +47,8 @@ SESSION_KEYS = ("deviceId", "deviceType", "sessionId")
 # Seconds between requests; likes go slower, as they change the account
 SEARCH_PAUSE = 1.0
 LIKE_PAUSE = 2.0
+# Likes a run makes at most before Liked Songs must have shown one of them on top
+ORDER_CHECK_LIMIT = 4
 
 AMAZON_DIR = "amazon"
 MATCHES_PATH = os.path.join(AMAZON_DIR, "matches.csv")
@@ -74,7 +76,7 @@ query SearchTracks($options: SearchTrackOptions!) {
 }"""
 USER_QUERY = "query User { user { id name } }"
 # Liked Songs, latest like first
-LATEST_LIKES_QUERY = "query LatestLikes { user { tracks(limit: 5) { edges { node { id } } } } }"
+LATEST_LIKES_QUERY = "query LatestLikes { user { tracks(limit: 1) { edges { node { id } } } } }"
 # The only write this importer makes. Never NEUTRAL or DISLIKE: nothing is ever unliked
 LIKE_MUTATION = """
 mutation Like($trackId: String!, $likeState: String!) {
@@ -373,6 +375,7 @@ def like_songs(client: AmazonMusicClient, state: dict, songs: list[str]) -> None
               "they will appear above the songs liked before.")
     client.pause = max(client.pause, LIKE_PAUSE)
     started = time.monotonic()
+    order_confirmed = False
     for i, track_asin in enumerate(pending, 1):
         try:
             answer = client.graphql(LIKE_MUTATION, {"trackId": track_asin, "likeState": "LIKE"})
@@ -385,11 +388,15 @@ def like_songs(client: AmazonMusicClient, state: dict, songs: list[str]) -> None
             raise ApiError(f"liking {track_asin} returned no result; stopped so a rerun keeps the order")
         state["liked"].append(track_asin)
         save_state(state)
-        # The order assumes Liked Songs lists the latest like first; confirm it before going on
-        if i == 2 and latest_like(client) != track_asin:
-            raise ApiError("Liked Songs does not list the latest like first, so the newest Yandex "
-                           "likes would end up at the bottom. Stopped after 2 likes; see 'Order' "
-                           "in importer/AMAZON_MUSIC.md.")
+        # The order assumes Liked Songs lists the latest like first. The first like is on top
+        # either way, and a song liked before may keep its place, so a few likes get to show it
+        if not order_confirmed and i > 1:
+            order_confirmed = latest_like(client) == track_asin
+            if not order_confirmed and i == ORDER_CHECK_LIMIT:
+                raise ApiError(f"Liked Songs did not show any of the last {i - 1} likes on top: it "
+                               "does not list the latest like first, so the newest Yandex likes "
+                               f"would end up at the bottom. Stopped after {i} likes; see 'Order' "
+                               "in importer/AMAZON_MUSIC.md.")
         if i % 50 == 0 or i == len(pending):
             print(progress(i, len(pending), started, "liked"))
     print(f"  Liked Songs: {len(state['liked'])} songs liked by this importer")

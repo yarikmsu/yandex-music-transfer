@@ -68,9 +68,10 @@ because likes cannot be reordered afterwards. The dry run lists those rows.
 
 Songs that are only in playlists are liked first, then your liked tracks from oldest to
 newest, so that your most recent Yandex likes end up on top of Liked Songs, which lists
-the latest like first. After the second like of a run the importer reads Liked Songs back
-and stops if the latest like is not on top, so a different order costs two likes, not
-hundreds. A song you approve after the first `import --apply` is still liked on a rerun,
+the latest like first. From the second like of a run on, the importer reads Liked Songs
+back until the latest like is on top, and stops after the fourth like if it never was, so
+a different order costs four likes, not hundreds. (One check is not enough: a song you had
+liked before may keep its old place.) A song you approve after the first `import --apply` is still liked on a rerun,
 but it lands above everything liked before.
 
 ## Rate limits and reruns

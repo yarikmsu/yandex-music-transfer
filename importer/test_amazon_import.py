@@ -78,7 +78,7 @@ def filters_of(variables):
 
 class FakeAmazon:
     """Answers searches from `answers`, keyed by (title, artist or None), keeps Liked Songs
-    newest first, and records every call."""
+    newest first (a song liked before keeps its place), and records every call."""
 
     pause = am.SEARCH_PAUSE
 
@@ -94,7 +94,8 @@ class FakeAmazon:
         if query == am.USER_QUERY:
             return {"user": {"id": "amzn1.account.TEST", "name": "Test User"}}
         if query == am.LIKE_MUTATION:
-            self.liked_songs.insert(0, variables["trackId"])
+            if variables["trackId"] not in self.liked_songs:
+                self.liked_songs.insert(0, variables["trackId"])
             return {"setTrackLikeState": {"__typename": "SetUserTrackLikeStateResponse"}}
         if query == am.LATEST_LIKES_QUERY:
             return {"user": {"tracks": {"edges": [{"node": {"id": s}} for s in self.liked_songs]}}}
@@ -395,19 +396,24 @@ class ImportTest(InTempDir):
         am.cmd_import(self.fake, apply=True)
         self.assertEqual(self.fake.pause, am.LIKE_PAUSE)
 
-    def test_liked_songs_in_another_order_stops_after_two_likes(self, _print):
-        oldest_first = FakeAmazon.graphql
+    def test_liked_songs_in_another_order_stops_after_a_few_likes(self, _print):
+        newest_first = FakeAmazon.graphql
 
         def graphql(query, variables):
-            answer = oldest_first(self.fake, query, variables)
+            answer = newest_first(self.fake, query, variables)
             if query == am.LATEST_LIKES_QUERY:
                 answer["user"]["tracks"]["edges"].reverse()
             return answer
 
         self.fake.graphql = graphql
         with self.assertRaises(am.ApiError):
-            am.cmd_import(self.fake, apply=True)
-        self.assertEqual(am.load_state()["liked"], [asin(12), asin(11)])
+            am.like_songs(self.fake, {"liked": []}, [asin(n) for n in range(1, 10)])
+        self.assertEqual(am.load_state()["liked"], [asin(n) for n in range(1, am.ORDER_CHECK_LIMIT + 1)])
+
+    def test_song_liked_before_does_not_stop_the_run(self, _print):
+        self.fake.liked_songs = [asin(2)]
+        am.like_songs(self.fake, {"liked": []}, [asin(1), asin(2), asin(3)])
+        self.assertEqual(self.fake.liked(), [asin(1), asin(2), asin(3)])
 
     def test_apply_refuses_while_rows_need_a_check(self, _print):
         self.rows["13"] = match("13", "check", asin(13))
