@@ -79,7 +79,7 @@ STRING_SECRET = re.compile(r"""\{secret:(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*
 NUMBER_SECRET = re.compile(r"\{secret:\[([\d,\s]*)\],version:(\d+)\}")
 OPERATION = re.compile(r'\("(\w+)","(?:query|mutation)","([0-9a-f]{64})"')
 BUNDLE = re.compile(re.escape(CDN) + r"web-player\.[0-9a-f]+\.js")
-# Webpack's chunk file names: .u=e=>""+({id:"name",...}[e]||e)+"."+{id:"hash",...}[e]+".js"
+# Webpack's chunk file names: .u=e=>""+(({id:"name",...})[e]||e)+"."+({id:"hash",...})[e]+".js"
 CHUNK_NAMES = re.compile(r'\.u=e=>""\+\(\(\{(.*?)\}\)\[e\]\|\|e\)\+"\."\+\(\{(.*?)\}\)\[e\]')
 CHUNK_ENTRY = re.compile(r'(\d+):"([^"]+)"')
 SEARCH_CHUNK = "xpui-routes-search"
@@ -246,11 +246,14 @@ class SpotifyClient(JsonClient):
                 "extensions": {"persistedQuery": {"version": 1, "sha256Hash": self.player.hashes[operation]}}}
         failures = 0
         while True:
-            errors = (answer := self._send(body)).get("errors") or []
-            if not errors:
-                return answer.get("data") or {}
+            answer = self._send(body)
+            errors = answer.get("errors") or []
+            data = answer.get("data") or {}
             if "PersistedQueryNotFound" in json.dumps(errors):
                 raise PlayerChanged(f"Spotify no longer knows the {operation} request")
+            # An error beside a result is a failed side field, such as cover art
+            if not errors or any(value is not None for value in data.values()):
+                return data
             messages = "; ".join(str(error.get("message", error)) if isinstance(error, dict) else str(error)
                                  for error in errors)
             # Spotify's own backend failures come back this way, in an HTTP 200 answer
@@ -308,7 +311,8 @@ def load_login() -> str:
     value = os.environ.get("SPOTIFY_SP_DC", "").strip().strip("'\"")
     if value.lower().startswith("cookie:"):
         value = value[len("cookie:"):].strip()
-    if ";" in value or "=" in value:
+    # A bare value may end in = padding, so only a name=value pair means a copied header
+    if ";" in value or value.startswith("sp_dc="):
         parts = (part.strip().partition("=") for part in value.split(";"))
         value = next((v for name, _, v in parts if name == "sp_dc"), "")
     if not value or value == COOKIE_PLACEHOLDER:
@@ -518,8 +522,8 @@ def cmd_import(client: SpotifyClient | None, apply: bool) -> None:
     if not matches:
         sys.exit("Run 'match' first.")
     liked, playlists = load_collections()
-    ids = {track_id: track_id_of(row["spotify_id"]) for track_id, row in matches.items()
-           if row["status"] == "matched" and track_id_of(row["spotify_id"])}
+    ids = {track_id: song for track_id, row in matches.items()
+           if row["status"] == "matched" and (song := track_id_of(row["spotify_id"]))}
     songs = like_order(liked, playlists, ids)
     write_not_imported(matches, ids, liked, playlists)
     print(f"Liked Songs: {len(songs)} songs from {len(liked)} liked tracks "

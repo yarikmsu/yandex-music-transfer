@@ -166,6 +166,9 @@ class LoginTest(unittest.TestCase):
         for value in ("AQB-x_1", "sp_dc=AQB-x_1", "'sp_dc=AQB-x_1'\n"):
             self.assertEqual(self.login(value), "AQB-x_1")
 
+    def test_bare_value_may_end_in_padding(self):
+        self.assertEqual(self.login("AQB-x_1=="), "AQB-x_1==")
+
     def test_value_is_picked_from_a_whole_cookie_header(self):
         self.assertEqual(self.login("cookie: sp_t=T1; sp_dc=AQB-x_1; sp_key=K"), "AQB-x_1")
 
@@ -373,6 +376,17 @@ class ClientTest(unittest.TestCase):
                           "data": {"searchV2": None}})
         with mock.patch("urllib.request.urlopen", side_effect=[failed, http_ok({"data": {"x": 1}})]):
             self.assertEqual(client.graphql("searchTracks", {}), {"x": 1})
+
+    @mock.patch.object(sp.time, "time", return_value=NOW)
+    def test_errors_beside_a_result_keep_the_result(self, _time, _sleep):
+        # A failed side field, such as cover art, still leaves the search results usable
+        client = self.client([("TOKEN", NOW + 3000)])
+        partial = http_ok({"errors": [{"message": "Exception while fetching data (/coverArt)"}],
+                           "data": search_data(track_data(tid(1), "Song", ["Band"], 183000))})
+        with mock.patch("urllib.request.urlopen", return_value=partial) as urlopen:
+            found = sp.parse_search(client.graphql("searchTracks", {}))
+        self.assertEqual([song["id"] for song in found], [tid(1)])
+        self.assertEqual(urlopen.call_count, 1)
 
 
 class MatchTest(unittest.TestCase):

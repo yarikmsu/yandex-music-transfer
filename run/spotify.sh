@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs importer/spotify_import.py in the same locked-down container as run.sh.
-# Usage: amazon.sh check | match | import [--apply]
+# Usage: spotify.sh check | match | import [--apply]
 set -euo pipefail
 
 BASE="$(cd "$(dirname "$0")/.." && pwd)"
