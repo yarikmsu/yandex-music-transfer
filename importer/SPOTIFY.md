@@ -86,6 +86,11 @@ Searches are paced at one a second, likes at one every 2 seconds, so ~1,800 trac
 about an hour to match and about as long to like. After an `HTTP 429` the script slows
 down and waits the block out.
 
+- Spotify sometimes answers a request with an error of its own (such as `Failed call to
+  search-api`, which came after a few hundred searches in testing). Such a request is
+  tried up to 8 times, waiting longer each time, about 10 minutes in all. If it still
+  fails, the run stops. A search names the track and the line that skips it; a like
+  stops so the order stays right.
 - `match` skips tracks already in `matches.csv`; delete a row to search it again.
 - `import --apply` records every song it liked in `out/spotify/state.json` and only likes
   what is missing. It never unlikes or removes anything; a like that fails stops the run,
